@@ -4,6 +4,7 @@ from .typecheck import types
 from .verify import (verify, assume, invariant, do_verification,
                             enable_verification, scope, verify_all, STORE)
 from .prettyprint import pretty_print
+from . import refinement
 
 from . import built_ins
 from . import log
@@ -20,5 +21,6 @@ __all__ = [
     'transformer',
     'prettyprint',
     'types',
+    'refinement',
     'built_ins'
 ]

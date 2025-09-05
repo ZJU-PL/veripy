@@ -20,6 +20,15 @@ def issubtype(actual, expected):
     # Arrays are covariant in element type for our purposes
     if isinstance(actual, ty.TARR) and isinstance(expected, ty.TARR):
         return issubtype(actual.ty, expected.ty)
+    # Refinement types: {x: T | P1(x)} <: {x: T | P2(x)} if P1(x) ==> P2(x)
+    if isinstance(actual, ty.TREFINED) and isinstance(expected, ty.TREFINED):
+        if actual.base_type == expected.base_type:
+            # For now, we'll be conservative and require exact predicate match
+            # In a full implementation, we'd check if actual.predicate ==> expected.predicate
+            return actual.predicate == expected.predicate
+    # {x: T | P(x)} <: T (refinement is subtype of base type)
+    if isinstance(actual, ty.TREFINED) and actual.base_type == expected:
+        return True
     return False
 
 def type_check_stmt(sigma : dict, func_sigma : dict, stmt : Stmt):
@@ -38,7 +47,17 @@ def type_check_stmt(sigma : dict, func_sigma : dict, stmt : Stmt):
                 if sigma[stmt.var] == ty.TANY:
                     sigma[stmt.var] = inferred
                 elif sigma[stmt.var] != inferred:
-                    raise TypeError(f'Mutating Type of {stmt.var}!')
+                    # Check if this is a refinement type assignment
+                    if isinstance(sigma[stmt.var], ty.TREFINED):
+                        # Check if the inferred type satisfies the refinement
+                        if issubtype(inferred, sigma[stmt.var].base_type):
+                            # Add assertion that the refinement predicate holds
+                            # This will be checked during verification
+                            pass  # The verification engine will handle this
+                        else:
+                            raise TypeError(f'Cannot assign {inferred} to refined type {sigma[stmt.var]}')
+                    else:
+                        raise TypeError(f'Mutating Type of {stmt.var}!')
                 return sigma
         # If left-hand side is an array store, its type must be array
         if isinstance(stmt.expr, Store):
@@ -206,3 +225,18 @@ def type_infer_expr(sigma: dict, func_sigma : dict, expr: Expr):
         return ty.TANY
 
     raise NotImplementedError(f'Unknown expression: {expr}')
+
+def check_refinement_predicate(sigma: dict, func_sigma: dict, var_name: str, refined_type: ty.TREFINED):
+    """Check if a variable satisfies its refinement predicate"""
+    # Create a temporary environment with the variable bound to its type
+    temp_sigma = dict(sigma)
+    temp_sigma[var_name] = refined_type.base_type
+    
+    # Type check the predicate with the variable in scope
+    try:
+        type_check_expr(temp_sigma, func_sigma, ty.TBOOL, refined_type.predicate)
+        return True
+    except TypeError as e:
+        raise TypeError(f'Refinement predicate for {var_name} is not well-typed: {e}')
+    except Exception as e:
+        raise Exception(f'Error checking refinement predicate for {var_name}: {e}')

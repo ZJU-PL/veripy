@@ -37,6 +37,15 @@ class TDICT(Type):
     def __repr__(self):
         return f'TDICT({self.key_ty},{self.val_ty})'
 
+class TREFINED(Type):
+    """Refinement type: {x: T | P(x)}"""
+    def __init__(self, base_type, predicate, var_name='x'):
+        self.base_type = base_type
+        self.predicate = predicate  # This will be an Expr from the parser
+        self.var_name = var_name
+    def __repr__(self):
+        return f'{{{self.var_name}: {self.base_type} | {self.predicate}}}'
+
 def name_to_ast_type(node):
     return {
         'int' : TINT,
@@ -66,6 +75,18 @@ def subscript_to_ast_type(node):
     if ty_contr == 'Tuple':
         ty_arg = to_ast_type(slice_node)
         return typing.Tuple[ty_arg]
+    if ty_contr == 'Refined':
+        # Handle Refined[T, predicate_string] syntax
+        if hasattr(slice_node, 'elts') and len(slice_node.elts) == 2:
+            base_ty = to_ast_type(slice_node.elts[0])
+            # The second element should be a string literal with the predicate
+            if hasattr(slice_node.elts[1], 's'):  # String literal
+                predicate_str = slice_node.elts[1].s
+                # Parse the predicate using the assertion parser
+                from veripy.parser.parser import parse_assertion
+                predicate_expr = parse_assertion(predicate_str)
+                return TREFINED(base_ty, predicate_expr)
+        return TANY
     return TANY
 
 def to_ast_type(ty):
@@ -78,4 +99,4 @@ BUILT_IN_FUNC_TYPE = {
     'len' : TARROW(typing.Sequence[typing.Any], TINT)
 }
 
-SUPPORTED = typing.Union[TINT, TBOOL, TARR, TSET, TDICT, typing.List]
+SUPPORTED = typing.Union[TINT, TBOOL, TARR, TSET, TDICT, TREFINED, typing.List]

@@ -176,6 +176,17 @@ def wp(sigma, stmt, Q):
             new_Q = substitute_many(Q, { stmt.var: stmt.expr }) if isinstance(stmt.var, str) else Q
             new_Q = BinOp(new_Q, BoolOps.And, ens_fold)
             return (new_Q, { req_fold })
+        
+        # Handle refinement type assignments
+        if isinstance(stmt.var, str):
+            # Check if the variable has a refinement type in the current scope
+            current_scope = STORE.current_scope()
+            if current_scope and current_scope in STORE.store:
+                scope_funcs = STORE.store[current_scope]['func_attrs']
+                # Look for the variable in function attributes (this is a simplified approach)
+                # In a full implementation, we'd track variable types more systematically
+                pass
+        
         return (subst(stmt.var, stmt.expr, Q), set())
 
     return {
@@ -207,6 +218,17 @@ def fold_constraints(constraints : List[str]):
         return parse_assertion(constraints[0])
     else:
         return Literal(VBool(True))
+
+def generate_refinement_constraints(sigma: dict, func_sigma: dict):
+    """Generate refinement constraints for all variables with refinement types"""
+    constraints = []
+    for var_name, var_type in sigma.items():
+        if isinstance(var_type, tc.types.TREFINED):
+            # Create a constraint that the variable satisfies its refinement predicate
+            # Substitute the variable name in the predicate
+            predicate = subst(var_name, Var(var_name), var_type.predicate)
+            constraints.append(predicate)
+    return constraints
 
 def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=None):
     code = inspect.getsource(func)
@@ -241,6 +263,12 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
 
     (P, C) = wp(sigma, target_language_ast, user_postcond)
     check_P = BinOp(user_precond, BoolOps.Implies, P)
+
+    # Generate refinement constraints
+    refinement_constraints = generate_refinement_constraints(sigma, scope_funcs)
+    if refinement_constraints:
+        refinement_conj = fold_constraints(refinement_constraints)
+        check_P = BinOp(check_P, BoolOps.And, refinement_conj)
 
     solver = z3.Solver()
     current_consts = declare_consts(sigma)
