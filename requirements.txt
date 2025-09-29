@@ -2,3 +2,4 @@ z3-solver
 pyparsing
 pytest
 pytest-cov
+apronpy
