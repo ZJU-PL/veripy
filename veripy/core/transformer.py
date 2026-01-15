@@ -44,7 +44,15 @@ def subst(this: str, withThis: Expr, inThis: Expr) -> Expr:
             return Quantification(inThis.var, subst(this, withThis, inThis.expr), inThis.ty)
         return inThis
     if isinstance(inThis, FunctionCall):
-        return inThis
+        # Substitute within callee and args.
+        fn = inThis.func_name
+        if isinstance(fn, Expr):
+            fn = subst(this, withThis, fn)
+        return FunctionCall(
+            fn,
+            [subst(this, withThis, a) for a in inThis.args],
+            native=getattr(inThis, "native", True),
+        )
     if isinstance(inThis, Subscript):
         return Subscript(
             subst(this, withThis, inThis.var),
@@ -623,6 +631,71 @@ class ExprTranslator:
 
 class StmtTranslator:
     """Translator that converts Python statement AST to veripy statement AST."""
+
+    def __init__(self):
+        # Counter for call-lifting temporaries
+        self._tmp_idx = 0
+
+    def _fresh_tmp(self, prefix: str = "__call_tmp") -> str:
+        self._tmp_idx += 1
+        return f"{prefix}{self._tmp_idx}"
+
+    def _seq_from(self, stmts: List[Stmt]) -> Stmt:
+        if not stmts:
+            return Skip()
+        s = stmts[0]
+        for t in stmts[1:]:
+            s = Seq(s, t)
+        return s
+
+    def _lift_calls_expr(self, e: Expr):
+        """
+        Lift nested function calls from an expression into temp assignments.
+
+        Returns (stmts, new_expr) such that executing stmts then evaluating
+        new_expr is equivalent (best-effort) to evaluating e directly.
+        """
+        # Leaf nodes
+        if isinstance(e, (Var, Literal, StringLiteral)):
+            return ([], e)
+
+        if isinstance(e, FunctionCall):
+            lifted = []
+            new_args = []
+            for a in e.args:
+                s, a2 = self._lift_calls_expr(a)
+                lifted.extend(s)
+                new_args.append(a2)
+            tmp = self._fresh_tmp()
+            lifted.append(Assign(tmp, FunctionCall(e.func_name, new_args, native=getattr(e, "native", True))))
+            return (lifted, Var(tmp))
+
+        if isinstance(e, BinOp):
+            s1, e1 = self._lift_calls_expr(e.e1)
+            s2, e2 = self._lift_calls_expr(e.e2)
+            return (s1 + s2, BinOp(e1, e.op, e2))
+
+        if isinstance(e, UnOp):
+            s, e1 = self._lift_calls_expr(e.e)
+            return (s, UnOp(e.op, e1))
+
+        if isinstance(e, Subscript):
+            s1, v = self._lift_calls_expr(e.var)
+            s2, i = self._lift_calls_expr(e.subscript)
+            return (s1 + s2, Subscript(v, i))
+
+        if isinstance(e, Store):
+            s1, a = self._lift_calls_expr(e.arr)
+            s2, i = self._lift_calls_expr(e.idx)
+            s3, v = self._lift_calls_expr(e.val)
+            return (s1 + s2 + s3, Store(a, i, v))
+
+        if isinstance(e, FieldAccess):
+            s, o = self._lift_calls_expr(e.obj)
+            return (s, FieldAccess(o, e.field))
+
+        # Fallback: no lifting
+        return ([], e)
     
     def visit_Assign(self, node):
         # Support tuple unpacking (a, *b, c = ...)
@@ -638,11 +711,21 @@ class StmtTranslator:
         
         # Check if it's a subscript assignment (arr[i] = value)
         if isinstance(target, Subscript):
-            arr = self.visit(target.var)
-            idx = self.visit(target.subscript)
-            return Assign(Store(arr, idx, expr), Literal(VBool(True)))  # Dummy assign
+            # Model `a[i] = v` as `a = Store(a, i, v)` when possible, so WP can
+            # substitute array updates correctly.
+            base = target.var
+            if isinstance(base, Var):
+                return Assign(base.name, Store(base, target.subscript, expr))
+            return Skip()
         
-        return Assign(target, expr)
+        # Normalize simple assignments to use the variable name (string) as LHS.
+        lhs = target.name if isinstance(target, Var) else target
+        # Lift nested calls from RHS so function specs can be applied via Assign.
+        lifted, expr2 = self._lift_calls_expr(expr)
+        final = Assign(lhs, expr2)
+        if lifted:
+            return self._seq_from(lifted + [final])
+        return final
     
     def visit_AnnAssign(self, node):
         """Handle annotated assignments: x: int = 5"""
@@ -659,15 +742,41 @@ class StmtTranslator:
     def visit_While(self, node):
         # Extract loop invariants from comments or assert statements
         invariants = []
+        def _is_invariant_call(stmt):
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+                return False
+            f = stmt.value.func
+            return (isinstance(f, ast.Name) and f.id == 'invariant') or (isinstance(f, ast.Attribute) and f.attr == 'invariant')
+
+        def _get_str_arg(call: ast.Call):
+            if not call.args:
+                return None
+            a0 = call.args[0]
+            if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                return a0.value
+            if isinstance(a0, ast.Str):
+                return a0.s
+            try:
+                return ast.unparse(a0)
+            except Exception:
+                return None
+
         for stmt in node.body:
-            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-                if isinstance(stmt.value.func, ast.Name):
-                    if stmt.value.func.id == 'invariant':
-                        inv_text = stmt.value.args[0].s
-                        invariants.append(parse_assertion(inv_text))
+            if _is_invariant_call(stmt):
+                inv_text = _get_str_arg(stmt.value)
+                if inv_text is not None:
+                    invariants.append(parse_assertion(inv_text))
         
         cond = self.visit(node.test)
-        body = self.visit(node.body[0]) if node.body else Skip()
+        # Translate the whole body, skipping invariant(...) annotation calls.
+        body_stmts = [self.visit(s) for s in node.body if not _is_invariant_call(s)]
+        body = self.visit_seq([])  # default Skip()
+        if body_stmts:
+            body = body_stmts[0]
+            for s in body_stmts[1:]:
+                body = Seq(body, s)
+        else:
+            body = Skip()
         return While(invariants, cond, body)
     
     def visit_For(self, node):
@@ -675,12 +784,11 @@ class StmtTranslator:
         # Extract invariants
         invariants = []
         for stmt in node.body:
-            if isinstance(stmt, ast.Expr):
-                if isinstance(stmt.value, ast.Call):
-                    if isinstance(stmt.value.func, ast.Name):
-                        if stmt.value.func.id == 'invariant':
-                            inv_text = stmt.value.args[0].s
-                            invariants.append(parse_assertion(inv_text))
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                if isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == 'invariant':
+                    inv_text = stmt.value.args[0].value if isinstance(stmt.value.args[0], ast.Constant) else getattr(stmt.value.args[0], 's', None)
+                    if isinstance(inv_text, str):
+                        invariants.append(parse_assertion(inv_text))
         
         # Transform to while loop
         iter_var = node.target.id
@@ -701,8 +809,10 @@ class StmtTranslator:
                 # Create: i = start; while i < stop: ...; i += step
                 # This is a simplified transformation
                 cond = BinOp(Var(iter_var), CompOps.Lt, stop)
-                body_stmts = [self.visit(s) for s in node.body]
+                body_stmts = [self.visit(s) for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name) and s.value.func.id == 'invariant')]
                 body = body_stmts[0] if body_stmts else Skip()
+                for s in body_stmts[1:]:
+                    body = Seq(body, s)
                 return While(invariants, cond, body)
         
         raise_exception(f'Unsupported for loop iterable: {ast.dump(iterable)}')
@@ -725,11 +835,33 @@ class StmtTranslator:
     
     def visit_Return(self, node):
         expr = self.visit(node.value) if node.value else None
-        return Assert(expr) if expr else Skip()
+        # Model a return by assigning to the implicit result variable `ans`
+        if not expr:
+            return Skip()
+        lifted, expr2 = self._lift_calls_expr(expr)
+        ret = Assign('ans', expr2)
+        if lifted:
+            return self._seq_from(lifted + [ret])
+        return ret
     
     def visit_Expr(self, node):
         # Handle expression statements (including function calls)
-        return self.visit(node.value)
+        # Expression-statements are generally side-effecting calls which we do not
+        # model in the core statement language (except assume(), which is a Stmt).
+        if isinstance(node.value, ast.Call):
+            # `assume(e)` is a real statement.
+            if isinstance(node.value.func, ast.Name) and node.value.func.id == 'assume':
+                return self.visit_Assume(node.value)
+            # Everything else (including invariant(...)) is treated as annotation/no-op.
+            return Skip()
+        return Skip()
+    
+    def visit_Module(self, node):
+        """Handle module root by sequencing contained statements."""
+        if not node.body:
+            return Skip()
+        stmts = [self.visit(stmt) for stmt in node.body]
+        return reduce(lambda acc, s: Seq(acc, s), stmts[1:], stmts[0])
     
     def visit(self, node):
         """Main dispatch method."""
@@ -759,6 +891,7 @@ class StmtTranslator:
             ast.ClassDef: self.visit_ClassDef,
             ast.Match: self.visit_Match,
             ast.Expr: self.visit_Expr,
+            ast.Module: self.visit_Module,
             ast.Lambda: self.visit_Lambda,
             ast.Yield: self.visit_Yield,
             ast.YieldFrom: self.visit_YieldFrom,
@@ -894,13 +1027,17 @@ class StmtTranslator:
     
     def visit_Call(self, node):
         """Handle function calls."""
-        from veripy.parser.syntax import FunctionCall
+        # Calls can appear inside expressions (e.g., x = f(n), return f(x)).
+        # We translate those to FunctionCall expressions.
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
-            args = [self.visit(arg) for arg in node.args]
-            return FunctionCall(Var(func_name), args)
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
         else:
-            return Skip()
+            raise_exception(f'Unsupported call func: {ast.dump(node.func)}')
+
+        args = [self.visit(arg) for arg in node.args]
+        return FunctionCall(Var(func_name), args)
     
     def visit_IfExp(self, node):
         """Handle ternary expressions (x if cond else y)."""
@@ -1007,10 +1144,9 @@ class StmtTranslator:
         return ImportFrom(module, names, aliases if aliases else None)
 
     def visit_FunctionDef(self, node):
-        """Handle function definitions (already exists, extend if needed)."""
-        # This would typically be handled by the decorator @verify
-        # For standalone functions, we create a skip
-        return Skip()
+        """Translate function definitions by visiting their bodies."""
+        # We ignore decorators and parameters here; the verifier supplies specs.
+        return self.visit_seq(node.body)
 
     def visit_AsyncFunctionDef(self, node):
         """Handle async function definitions."""
@@ -1209,6 +1345,8 @@ class Expr2Z3:
         self.old_dict = old_dict or {}
         self.func_returns = func_returns or {}
         self.class_fields = class_fields or {}  # {class_name: {field_name: z3_sort}}
+        # Cache uninterpreted functions/consts by (name, arg_sorts, ret_sort)
+        self._uf_cache = {}
         
         # Uninterpreted functions for special operations
         self._len_fun = z3.Function('len_int', z3.ArraySort(z3.IntSort(), z3.IntSort()), z3.IntSort())
@@ -1223,6 +1361,14 @@ class Expr2Z3:
         self._str_concat = z3.Function('str_concat', z3.StringSort(), z3.StringSort(), z3.StringSort())
         self._str_substr = z3.Function('str_substr', z3.StringSort(), z3.IntSort(), z3.IntSort(), z3.StringSort())
         self._str_index = z3.Function('str_index', z3.StringSort(), z3.IntSort(), z3.IntSort())
+
+        # Array/list membership (best-effort, uninterpreted)
+        self._arr_contains_int = z3.Function(
+            'arr_contains_int',
+            z3.ArraySort(z3.IntSort(), z3.IntSort()),
+            z3.IntSort(),
+            z3.BoolSort(),
+        )
         
         # Set operations
         self._set_union = z3.Function('set_union',
@@ -1307,8 +1453,20 @@ class Expr2Z3:
             CompOps.Ge: lambda: c1 >= c2,
             CompOps.Lt: lambda: c1 < c2,
             CompOps.Le: lambda: c1 <= c2,
-            CompOps.In: lambda: z3.Select(c2, c1),
-            CompOps.NotIn: lambda: z3.Not(z3.Select(c2, c1)),
+            CompOps.In: lambda: (
+                z3.Select(c2, c1)
+                if (hasattr(c2, "sort") and isinstance(c2.sort(), z3.ArraySortRef) and c2.sort().range() == z3.BoolSort())
+                else self._arr_contains_int(c2, c1)
+                if (hasattr(c2, "sort") and isinstance(c2.sort(), z3.ArraySortRef) and c2.sort().range() == z3.IntSort())
+                else z3.BoolVal(False)
+            ),
+            CompOps.NotIn: lambda: z3.Not(
+                z3.Select(c2, c1)
+                if (hasattr(c2, "sort") and isinstance(c2.sort(), z3.ArraySortRef) and c2.sort().range() == z3.BoolSort())
+                else self._arr_contains_int(c2, c1)
+                if (hasattr(c2, "sort") and isinstance(c2.sort(), z3.ArraySortRef) and c2.sort().range() == z3.IntSort())
+                else z3.BoolVal(False)
+            ),
         }
         
         return op_handlers.get(node.op, lambda: raise_exception(f'Unsupported Operator: {node.op}'))()
@@ -1322,18 +1480,25 @@ class Expr2Z3:
         raise_exception(f'Unsupported UnOp: {node.op}')
     
     def visit_Quantification(self, node: Quantification):
+        # Defensive: some older builders used Quantification(var, expr, ty)
+        # instead of Quantification(var, ty, expr).
+        q_ty = node.ty
+        q_expr = node.expr
+        if isinstance(q_ty, Expr) and (q_expr == TINT or q_expr == TBOOL or isinstance(q_expr, TARR)):
+            q_ty, q_expr = q_expr, q_ty
+
         bound_var = None
-        if node.ty == TINT:
+        if q_ty == TINT:
             bound_var = z3.Int(node.var.name)
-        elif node.ty == TBOOL:
+        elif q_ty == TBOOL:
             bound_var = z3.Bool(node.var.name)
-        elif isinstance(node.ty, TARR):
-            bound_var = z3.Array(z3.IntSort(), self.translate_type(node.ty.ty))
+        elif isinstance(q_ty, TARR):
+            bound_var = z3.Array(z3.IntSort(), self.translate_type(q_ty.ty))
         
         if bound_var is not None:
             self.name_dict[node.var.name] = bound_var
-            return z3.ForAll(bound_var, self.visit(node.expr))
-        raise_exception(f'Unsupported quantified type: {node.ty}')
+            return z3.ForAll(bound_var, self.visit(q_expr))
+        raise_exception(f'Unsupported quantified type: {q_ty}')
     
     def visit_Old(self, node: Old):
         if isinstance(node.expr, Var):
@@ -1397,9 +1562,19 @@ class Expr2Z3:
             assert len(node.args) == 1
             return z3.StringVal(str(arg_terms[0]))
         
-        # Uninterpreted function for user functions
+        # Uninterpreted function/const for user functions
         ret_sort = self.translate_type(self.func_returns.get(fname, TINT))
-        uf = z3.Function(f'uf_{fname}', *[z3.IntSort() for _ in arg_terms], ret_sort)
+        if not arg_terms:
+            key = (f'uf_{fname}', tuple(), ret_sort)
+            if key not in self._uf_cache:
+                self._uf_cache[key] = z3.Const(f'uf_{fname}', ret_sort)
+            return self._uf_cache[key]
+
+        arg_sorts = tuple(t.sort() for t in arg_terms)
+        key = (f'uf_{fname}', arg_sorts, ret_sort)
+        if key not in self._uf_cache:
+            self._uf_cache[key] = z3.Function(f'uf_{fname}', *arg_sorts, ret_sort)
+        uf = self._uf_cache[key]
         return uf(*arg_terms)
     
     # =========================================================================

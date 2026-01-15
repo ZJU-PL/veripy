@@ -638,7 +638,12 @@ class Assign(Stmt):
         return f'(Assign {self.var} = {self.expr})'
     
     def variables(self):
-        return {self.var, *self.expr.variables()}
+        v = set(self.expr.variables())
+        if isinstance(self.var, str):
+            v.add(self.var)
+        elif isinstance(self.var, Var):
+            v.add(self.var.name)
+        return v
 
 class FieldAssignStmt(Stmt):
     """Assignment to object field."""

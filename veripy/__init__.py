@@ -1,5 +1,5 @@
 """
-Veripy - A production-ready auto-active verification system for Python.
+Veripy - An auto-active verification system for Python.
 
 This package provides comprehensive verification capabilities for Python programs,
 inspired by Dafny and Verus.

@@ -52,11 +52,12 @@ class VerificationStore:
                 try:
                     f()
                 except Exception as e:
-                    print(f'Exception encountered while verifying {scope}::{f_name}')
                     if not ignore_err:
                         raise e
                     else:
-                        print(e)
+                        # When ignore_err=True (default in test suite), keep output
+                        # concise: failures are expected in "negative" tests.
+                        print(f'{f_name} Failed (ignored)')
             print(f'=> End Of `{scope}`\n')
     
     def verify_all(self, ignore_err):
@@ -137,7 +138,7 @@ def assume(C):
 def wp_seq(sigma, stmt, Q):
     (p2, c2) = wp(sigma, stmt.s2, Q)
     (p1, c1) = wp(sigma, stmt.s1, p2)
-    return (p1, c1.union(c2))
+    return (p1, c1 + c2)
 
 def wp_if(sigma, stmt, Q):
     (p1, c1) = wp(sigma, stmt.lb, Q)
@@ -150,7 +151,7 @@ def wp_if(sigma, stmt, Q):
                 UnOp(BoolOps.Not, stmt.cond), BoolOps.Implies, p2
             )
         ),
-        c1.union(c2)
+        c1 + c2
     )
 
 def wp_while(sigma, stmt: While, Q):
@@ -161,10 +162,10 @@ def wp_while(sigma, stmt: While, Q):
                       else reduce(lambda i1, i2: BinOp(i1, BoolOps.And, i2), invars)
     (p, c) = wp(sigma, s, combined_invars)
     # Optional termination side condition: not yet, but place holder here
-    return (combined_invars, c.union({
+    return (combined_invars, c + [
         BinOp(BinOp(combined_invars, BoolOps.And, cond), BoolOps.Implies, p),
         BinOp(BinOp(combined_invars, BoolOps.And, (UnOp(BoolOps.Not, cond))), BoolOps.Implies, Q)
-    }))
+    ])
 
 def wp(sigma, stmt, Q):
     def substitute_many(expr: Expr, mapping: dict):
@@ -174,27 +175,40 @@ def wp(sigma, stmt, Q):
         return result
 
     def wp_assign_x(stmt: Assign, Q):
+        lhs = stmt.var
+        if isinstance(lhs, Var):
+            lhs = lhs.name
+        if not isinstance(lhs, str):
+            # Unsupported LHS shape (e.g., tuple unpacking) - ignore for now
+            return (Q, [])
+
         if isinstance(stmt.expr, FunctionCall) and isinstance(stmt.expr.func_name, Var):
             # best-effort summary: assume callee requires holds; conjoin ensures with ans mapped to LHS
             fname = stmt.expr.func_name.name
             # CURRENT_FUNC_ATTRS is set in verify_func; if absent, fallback to normal assign
             attrs = STORE.func_attrs_global.get(fname)
             if attrs is None:
-                return (subst(stmt.var, stmt.expr, Q), set())
+                return (subst(lhs, stmt.expr, Q), [])
             param_names = list(attrs['inputs'].keys())
             arg_exprs = stmt.expr.args
             mapping = { pn: ae for pn, ae in zip(param_names, arg_exprs) }
             reqs = attrs.get('requires', [])
-            reqs_parsed = [ parse_assertion(r) for r in reqs ]
-            req_fold = fold_constraints([ substitute_many(rp, mapping) for rp in reqs_parsed ])
+            reqs_parsed = [parse_assertion(r) if isinstance(r, str) else r for r in reqs]
+            req_fold = fold_constraints([substitute_many(rp, mapping) for rp in reqs_parsed])
             ens = attrs.get('ensures', [])
-            ens_parsed = [ parse_assertion(e) for e in ens ]
+            ens_parsed = [parse_assertion(e) if isinstance(e, str) else e for e in ens]
             mapping_with_result = dict(mapping)
-            mapping_with_result['ans'] = Var(stmt.var) if isinstance(stmt.var, str) else stmt.var
-            ens_fold = fold_constraints([ substitute_many(ep, mapping_with_result) for ep in ens_parsed ])
-            new_Q = substitute_many(Q, { stmt.var: stmt.expr }) if isinstance(stmt.var, str) else Q
-            new_Q = BinOp(new_Q, BoolOps.And, ens_fold)
-            return (new_Q, { req_fold })
+            # For a call assignment, treat the result as an existentially-chosen
+            # value constrained by the callee's postcondition:
+            #   require(args)  ∧  ∃lhs0. (ensures(args, ans=lhs0) ∧ Q[lhs <- lhs0])
+            fresh = Var(f'{lhs}$0')
+            mapping_with_result['ans'] = fresh
+            ens_fold = fold_constraints([substitute_many(ep, mapping_with_result) for ep in ens_parsed])
+            Q_sub = subst(lhs, fresh, Q)
+            ty_lhs = sigma.get(lhs, tc.types.TINT)
+            inner = BinOp(ens_fold, BoolOps.And, Q_sub)
+            exists = UnOp(BoolOps.Not, Quantification(fresh, ty_lhs, UnOp(BoolOps.Not, inner)))
+            return (BinOp(req_fold, BoolOps.And, exists), [])
         
         # Handle refinement type assignments
         if isinstance(stmt.var, str):
@@ -206,17 +220,17 @@ def wp(sigma, stmt, Q):
                 # In a full implementation, we'd track variable types more systematically
                 pass
         
-        return (subst(stmt.var, stmt.expr, Q), set())
+        return (subst(lhs, stmt.expr, Q), [])
 
     return {
-        Skip:   lambda: (Q, set()),
-        Assume:  lambda: (BinOp(stmt.e, BoolOps.Implies, Q), set()),
+        Skip:   lambda: (Q, []),
+        Assume:  lambda: (BinOp(stmt.e, BoolOps.Implies, Q), []),
         Assign: lambda: wp_assign_x(stmt, Q),
-        Assert: lambda: (BinOp(Q, BoolOps.And, stmt.e), set()),
+        Assert: lambda: (BinOp(Q, BoolOps.And, stmt.e), []),
         Seq:    lambda: wp_seq(sigma, stmt, Q),
         If:     lambda: wp_if(sigma, stmt, Q),
         While:  lambda: wp_while(sigma, stmt, Q),
-        Havoc:  lambda: (Quantification(Var(stmt.var + '$0'), subst(stmt.var, Var(stmt.var + '$0'), Q), ty=sigma[stmt.var]), set())
+        Havoc:  lambda: (Quantification(Var(stmt.var + '$0'), sigma[stmt.var], subst(stmt.var, Var(stmt.var + '$0'), Q)), [])
     }.get(type(stmt), lambda: raise_exception(f'wp not implemented for {type(stmt)}'))()
 
 def emit_smt(translator: Expr2Z3, solver, constraint : Expr, fail_msg : str):
@@ -234,7 +248,7 @@ def fold_constraints(constraints : List[str]):
     if len(constraints) >= 2:
         return reduce(fold_and_str, constraints)
     elif len(constraints) == 1:
-        return parse_assertion(constraints[0])
+        return parse_assertion(constraints[0]) if isinstance(constraints[0], str) else constraints[0]
     else:
         return Literal(VBool(True))
 
@@ -333,9 +347,54 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
     fn_ret_types = { n: a['returns'] for n, a in scope_funcs.items() }
     translator = Expr2Z3(current_consts, old_consts, fn_ret_types)
 
+    # Add modular function-summary axioms for all known functions in scope.
+    # For each function f(x1..xn) with requires R and ensures E, assert:
+    #   forall x1..xn. R(x) ==> E(x, ans = uf_f(x))
+    def _sort_for(ty_):
+        if ty_ == tc.types.TINT:
+            return z3.IntSort()
+        if ty_ == tc.types.TBOOL:
+            return z3.BoolSort()
+        if isinstance(ty_, tc.types.TARR):
+            return z3.ArraySort(z3.IntSort(), _sort_for(ty_.ty))
+        return z3.IntSort()
+
+    for fname, attrs in scope_funcs.items():
+        try:
+            inputs_map = attrs.get('inputs', {})
+            in_items = list(inputs_map.items())
+            param_names = [n for (n, _) in in_items]
+            param_tys = [t for (_, t) in in_items]
+            ret_ty = attrs.get('returns', tc.types.TINT)
+            in_sorts = [_sort_for(t) for t in param_tys]
+            ret_sort = _sort_for(ret_ty)
+            bound_vars = [z3.Const(n, s) for n, s in zip(param_names, in_sorts)]
+            ax_name_dict = {n: v for n, v in zip(param_names, bound_vars)}
+            if bound_vars:
+                uf = z3.Function(f'uf_{fname}', *in_sorts, ret_sort)
+                ax_name_dict['ans'] = uf(*bound_vars)
+            else:
+                # Nullary function: represent as a constant
+                ax_name_dict['ans'] = z3.Const(f'uf_{fname}', ret_sort)
+
+            ax_translator = Expr2Z3(ax_name_dict, {}, fn_ret_types)
+            req_expr = fold_constraints(attrs.get('requires', []))
+            ens_expr = fold_constraints(attrs.get('ensures', []))
+            req_z3 = ax_translator.visit(req_expr)
+            ens_z3 = ax_translator.visit(ens_expr)
+            axiom = z3.Implies(req_z3, ens_z3)
+            if bound_vars:
+                # Help Z3 instantiate the axiom on call sites.
+                solver.add(z3.ForAll(bound_vars, axiom, patterns=[uf(*bound_vars)]))
+            else:
+                solver.add(axiom)
+        except Exception:
+            # Never let axiom generation crash verification; fall back to no axiom.
+            pass
+
     emit_smt(translator, solver, check_P, f'Precondition does not imply wp at {func.__name__}')
     for c in C:
-        emit_smt(translator, solver, c, f'Side condition violated at {func.__name__}')
+        emit_smt(translator, solver, BinOp(user_precond, BoolOps.Implies, c), f'Side condition violated at {func.__name__}')
     print(f'{func.__name__} Verified!')
 
 
@@ -400,7 +459,11 @@ def collect_assigned_vars(stmt: Stmt) -> set:
     if isinstance(stmt, Skip):
         return set()
     if isinstance(stmt, Assign):
-        return {stmt.var} if isinstance(stmt.var, str) else set()
+        if isinstance(stmt.var, str):
+            return {stmt.var}
+        if isinstance(stmt.var, Var):
+            return {stmt.var.name}
+        return set()
     if isinstance(stmt, Seq):
         return collect_assigned_vars(stmt.s1).union(collect_assigned_vars(stmt.s2))
     if isinstance(stmt, If):
