@@ -92,6 +92,14 @@ def subst(this: str, withThis: Expr, inThis: Expr) -> Expr:
 
 class ExprTranslator:
     """Translator that converts Python AST to veripy AST."""
+
+    def __init__(self):
+        # Fresh names for list-literal base arrays so different literals do not alias.
+        self._list_lit_idx = 0
+
+    def _fresh_list_base(self) -> Var:
+        self._list_lit_idx += 1
+        return Var(f'__list_lit_base{self._list_lit_idx}')
     
     def fold_binops(self, op: Op, values: List[Expr]) -> Expr:
         result = BinOp(self.visit(values[0]), op, self.visit(values[1]))
@@ -329,12 +337,17 @@ class ExprTranslator:
     
     def visit_List(self, node):
         """Handle list literals: [1, 2, 3]"""
-        elements = [self.visit(e) for e in node.elts]
-        return ListComprehension(
-            Var('__elem__'),
-            Literal(VInt(0)),  # Placeholder
-            Literal(VInt(len(elements)))  # Just track length
-        )
+        # Starred list construction (e.g., [*a, *b]) is difficult to model
+        # precisely in our current logic; return a conservative placeholder.
+        if any(isinstance(e, ast.Starred) for e in node.elts):
+            # Placeholder list comprehension standing for an unknown array value.
+            return ListComprehension(Var('__elem__'), Var('__x__'), Var('__iter__'))
+        # Model list literals as arrays with known values at concrete indices.
+        # Unspecified indices remain unconstrained (sound over-approximation).
+        base: Expr = self._fresh_list_base()
+        for i, e in enumerate(node.elts):
+            base = Store(base, Literal(VInt(i)), self.visit(e))
+        return base
     
     def visit_Set(self, node):
         """Handle set literals: {1, 2, 3}"""
@@ -640,6 +653,16 @@ class StmtTranslator:
         self._tmp_idx += 1
         return f"{prefix}{self._tmp_idx}"
 
+    def _list_literal_expr(self, elts: List[ast.AST]) -> Expr:
+        """
+        Model a Python list literal as an array with Stores at concrete indices.
+        Unspecified indices are unconstrained.
+        """
+        base: Expr = Var(self._fresh_tmp("__list_lit_base"))
+        for i, e in enumerate(elts):
+            base = Store(base, Literal(VInt(i)), self.visit(e))
+        return base
+
     def _seq_from(self, stmts: List[Stmt]) -> Stmt:
         if not stmts:
             return Skip()
@@ -700,10 +723,25 @@ class StmtTranslator:
     def visit_Assign(self, node):
         # Support tuple unpacking (a, *b, c = ...)
         if isinstance(node.targets[0], ast.Tuple):
-            target = Var('__unpack__')
+            # Represent unpacking explicitly so the verifier can fail closed
+            # (silently dropping these updates would be unsound).
+            def _tgt(t):
+                if isinstance(t, ast.Starred):
+                    inner = t.value.id if isinstance(t.value, ast.Name) else str(t.value)
+                    return ('*', inner)
+                if isinstance(t, ast.Name):
+                    return t.id
+                return str(t)
+            unpack_target = tuple(_tgt(t) for t in node.targets[0].elts)
+            expr = self.visit(node.value) if not isinstance(node.value, ast.List) else self._list_literal_expr(node.value.elts)
+            return Assign(unpack_target, expr)
         else:
             target = self.visit(node.targets[0])
-        expr = self.visit(node.value)
+        # Translate RHS (list literals need special handling in statement context).
+        if isinstance(node.value, ast.List):
+            expr = self._list_literal_expr(node.value.elts)
+        else:
+            expr = self.visit(node.value)
         
         # Check for field assignment (obj.field = value)
         if isinstance(target, FieldAccess):
@@ -716,7 +754,8 @@ class StmtTranslator:
             base = target.var
             if isinstance(base, Var):
                 return Assign(base.name, Store(base, target.subscript, expr))
-            return Skip()
+            # Fail closed: skipping updates to complex bases is unsound.
+            raise_exception('Unsupported subscript assignment base (must be a variable)')
         
         # Normalize simple assignments to use the variable name (string) as LHS.
         lhs = target.name if isinstance(target, Var) else target
@@ -852,8 +891,15 @@ class StmtTranslator:
             # `assume(e)` is a real statement.
             if isinstance(node.value.func, ast.Name) and node.value.func.id == 'assume':
                 return self.visit_Assume(node.value)
-            # Everything else (including invariant(...)) is treated as annotation/no-op.
-            return Skip()
+            # For other calls, fail closed by routing through Assign so that
+            # preconditions/ensures are enforced via wp_assign_x.
+            call_expr = self.visit(node.value)
+            tmp = self._fresh_tmp("__expr_call")
+            lifted, expr2 = self._lift_calls_expr(call_expr)
+            final = Assign(tmp, expr2)
+            if lifted:
+                return self._seq_from(lifted + [final])
+            return final
         return Skip()
     
     def visit_Module(self, node):
@@ -961,12 +1007,9 @@ class StmtTranslator:
 
     def visit_List(self, node):
         """Handle list literals in statement context."""
-        elements = [self.visit(e) for e in node.elts]
-        return ListComprehension(
-            Var('__elem__'),
-            Literal(VInt(0)),
-            Literal(VInt(len(elements)))
-        )
+        if any(isinstance(e, ast.Starred) for e in node.elts):
+            return ListComprehension(Var('__elem__'), Var('__x__'), Var('__iter__'))
+        return self._list_literal_expr(node.elts)
     
     def visit_BoolOp(self, node):
         """Handle boolean operations."""
@@ -1347,6 +1390,8 @@ class Expr2Z3:
         self.class_fields = class_fields or {}  # {class_name: {field_name: z3_sort}}
         # Cache uninterpreted functions/consts by (name, arg_sorts, ret_sort)
         self._uf_cache = {}
+        # Cache for list-comprehension placeholders
+        self._listcomp_cache = {}
         
         # Uninterpreted functions for special operations
         self._len_fun = z3.Function('len_int', z3.ArraySort(z3.IntSort(), z3.IntSort()), z3.IntSort())
@@ -1731,14 +1776,26 @@ class Expr2Z3:
         arg_sorts = [a.sort() for a in args]
         ret_sort = z3.IntSort()  # Simplified
         
-        method_func = z3.Method(method_name, obj_sort, *arg_sorts, ret_sort)
+        # Z3 has no "Method" API; model as an uninterpreted function.
+        method_func = z3.Function(f'method_{method_name}', obj_sort, *arg_sorts, ret_sort)
         return method_func(obj, *args)
     
     def visit_ListComprehension(self, node: ListComprehension):
-        """List comprehension - simplified to uninterpreted for now."""
-        # Full support requires loop transformation
-        # Return a placeholder
-        return z3.K(z3.IntSort(), z3.IntVal(0))
+        """
+        List comprehension placeholder.
+
+        For soundness, do NOT return a concrete constant array (that would
+        assert facts like "all elements are 0"). Instead, model the result as
+        an unconstrained array value.
+        """
+        key = repr(node)
+        if key not in self._listcomp_cache:
+            self._listcomp_cache[key] = z3.Array(
+                f'listcomp_{len(self._listcomp_cache) + 1}',
+                z3.IntSort(),
+                z3.IntSort(),
+            )
+        return self._listcomp_cache[key]
     
     def visit_SetComprehension(self, node: SetComprehension):
         """Set comprehension - simplified to uninterpreted."""

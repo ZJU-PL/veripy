@@ -16,8 +16,10 @@ import inspect
 import sys
 
 from veripy.parser.syntax import *
-from veripy.parser.parser import parse_assertion
-from veripy.core.verify import STORE, wp, emit_smt, fold_constraints, declare_consts
+from veripy.parser.syntax import CompOps
+from veripy.parser.parser import parse_assertion, parse_expr
+from veripy.core.verify import STORE, wp, emit_smt, fold_constraints, declare_consts, parse_func_types, subst, verify_func
+
 from veripy.core.transformer import StmtTranslator, Expr2Z3
 from veripy.typecheck import types as tc_types
 from veripy.auto_active import TerminationChecker, check_termination
@@ -74,7 +76,8 @@ class RecursiveVerifier:
         }
     
     def analyze_recursive_function(self, func_name: str, code: str,
-                                   decreases: Optional[str] = None) -> Dict[str, Any]:
+                                   decreases: Optional[str] = None,
+                                   func_obj=None) -> Dict[str, Any]:
         """
         Analyze a recursive function for verification.
         
@@ -82,6 +85,7 @@ class RecursiveVerifier:
             func_name: Name of the function
             code: Function source code
             decreases: Optional decreases expression
+            func_obj: The actual function object
         
         Returns:
             Dictionary with analysis results
@@ -109,7 +113,8 @@ class RecursiveVerifier:
             "decreases_info": decreases_info,
             "recursive_calls": recursive_calls,
             "recursion_type": recursion_type,
-            "verified": False
+            "verified": False,
+            "func_obj": func_obj
         }
         
         return {
@@ -131,10 +136,20 @@ class RecursiveVerifier:
                         # This is a recursive call
                         arg_names = []
                         for arg in child.args:
-                            if isinstance(arg, ast.Name):
-                                arg_names.append(arg.id)
-                            elif isinstance(arg, ast.Constant):
-                                arg_names.append(str(arg.value))
+                            try:
+                                # Use ast.unparse to get string representation of argument
+                                arg_names.append(ast.unparse(arg))
+                            except AttributeError:
+                                # Fallback for older python versions or partial support
+                                if isinstance(arg, ast.Name):
+                                    arg_names.append(arg.id)
+                                elif isinstance(arg, ast.Constant):
+                                    arg_names.append(str(arg.value))
+                                else:
+                                    # Fallback: try to reconstruct simple binops manually or skip
+                                    # This is a limitation if ast.unparse is not available
+                                    pass
+
                         
                         # Check if it's a tail call
                         is_tail = self._is_tail_call(node, child)
@@ -300,6 +315,7 @@ class RecursiveVerifier:
         
         func_info = self.recursive_functions[func_name]
         decreases = func_info.get("decreases")
+        requires = func_info.get("_veripy_requires", [])
         
         # Check for decreases clause
         if not decreases:
@@ -309,15 +325,15 @@ class RecursiveVerifier:
             else:
                 return False, f"Recursive function '{func_name}' requires a decreases clause"
         
-        # Use the termination checker
-        is_valid, message = check_termination(func_name, decreases, [])
+        # Statically check that each recursive call strictly decreases the measure.
+        ok, msg = self._verify_decreases_respected(func_name, decreases, requires)
         
-        if is_valid:
+        if ok:
             self.statistics["termination_proofs"] += 1
-        else:
-            self.statistics["termination_failures"] += 1
+            return True, msg
         
-        return is_valid, message
+        self.statistics["termination_failures"] += 1
+        return False, msg
     
     def verify_recursive_function(self, func_name: str, 
                                   requires: List[str],
@@ -371,6 +387,33 @@ class RecursiveVerifier:
                     return False, msg
             
             self.statistics["recursive_functions_verified"] += 1
+            
+            # Now verify the functional correctness using core verify_func
+            # We need to make sure the function is in the STORE (which it should be from the decorator)
+            # verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=None)
+            
+            # Get the function object (we don't have it directly here, need to find it or pass it)
+            # Actually, verify_recursive_function is called by verify_all_recursive which iterates over stored info.
+            # But verify_func expects the actual function object to parse source code.
+            # We have the source code in func_info['code'].
+            
+            # To reuse verify_func, we need to handle the fact that it parses inspect.getsource.
+            # We can't easily pass the function object here unless we store it.
+            # But wait, verify_recursive decorator stores analysis on the function object.
+            # verify_all_recursive iterates over recursive_functions which are just dicts.
+            # We lost the function object in recursive_verifier.recursive_functions!
+            
+            # Let's fix this by storing the function object in recursive_functions
+            func_obj = func_info.get("func_obj")
+            if func_obj:
+                 try:
+                     # verify_func prints "Verified!" on success or raises Exception
+                     verify_func(func_obj, scope, attrs['inputs'], requires, ensures)
+                 except Exception as e:
+                     return False, f"Functional verification failed: {e}"
+            else:
+                 return False, "Function object not found for verification"
+
             return True, f"Function {func_name} verified successfully"
             
         except Exception as e:
@@ -383,38 +426,69 @@ class RecursiveVerifier:
             # Parse decreases expression
             decreases_expr = parse_assertion(decreases)
             
-            # For each recursive call, verify that the decreases expression
-            # actually decreases
+            # Get function attributes to access parameters
+            attrs = None
+            scope = STORE.current_scope()
+            if scope and func_name in STORE.store[scope]['func_attrs']:
+                attrs = STORE.get_func_attrs(scope, func_name)
+            else:
+                # Search all scopes
+                for s in STORE.store:
+                    if func_name in STORE.store[s]['func_attrs']:
+                        attrs = STORE.store[s]['func_attrs'][func_name]
+                        break
+            
+            if not attrs:
+                return False, f"Could not find function attributes for {func_name}"
+
+            params = list(attrs['inputs'].keys())
+            sigma = attrs['inputs']
+            current_consts = declare_consts(sigma)
+
+            # For each recursive call, verify that the decreases expression actually decreases
             for call in self.recursive_functions[func_name].get("recursive_calls", []):
-                # Create constraints for the call
+                args_str = call.arguments
+                if len(args_str) != len(params):
+                     return False, f"Argument count mismatch in recursive call at line {call.line}"
+                
+                # Create substitution map
+                mapping = {}
+                for p, a in zip(params, args_str):
+                    mapping[p] = parse_expr(a)
+                
+                # Substitute in decreases expr to get decreases_call
+                decreases_call = decreases_expr
+                for p, val in mapping.items():
+                    decreases_call = subst(p, val, decreases_call)
+                
                 solver = z3.Solver()
+                translator = Expr2Z3(current_consts)
                 
-                # Add requires
-                for req in requires:
-                    req_expr = parse_assertion(req)
-                    translator = Expr2Z3({})
-                    z3_expr = translator.visit(req_expr)
-                    solver.add(z3_expr)
+                # Add preconditions
+                req_conj = fold_constraints(requires)
+                req_z3 = translator.visit(req_conj)
+                solver.add(req_z3)
                 
-                # Add: requires AND decreases > 0 AND call returns
-                # Should imply decreases' < decreases
-                # (where decreases' is the decreases expression for the call arguments)
+                # Check 1: decreases >= 0
+                # We check: requires => decreases >= 0
+                check_pos = BinOp(decreases_expr, CompOps.Ge, Literal(VInt(0)))
+                try:
+                    emit_smt(translator, solver, check_pos, "Decreases expression must be non-negative")
+                except Exception as e:
+                    return False, str(e)
                 
-                # This is a simplified check - full verification would need
-                # more sophisticated reasoning about the call arguments
-                
-                solver.add(z3.Int(decreases) > 0)
-                
-                result = solver.check()
-                if result == z3.sat:
-                    continue  # This is expected
-                else:
-                    return False, f"Decreases clause may not hold for all inputs"
+                # Check 2: decreases_call < decreases
+                # We check: requires => decreases_call < decreases
+                check_dec = BinOp(decreases_call, CompOps.Lt, decreases_expr)
+                try:
+                    emit_smt(translator, solver, check_dec, f"Recursive call at line {call.line} does not decrease measure")
+                except Exception as e:
+                    return False, str(e)
             
             return True, "Decreases clause verified"
             
         except Exception as e:
-            return True, f"Could not fully verify decreases: {e}"
+            return False, f"Decreases verification failed: {e}"
     
     def get_call_graph(self) -> Dict[str, List[str]]:
         """Get the call graph of recursive functions."""
@@ -467,8 +541,13 @@ def verify_recursive(requires: List[str], ensures: List[str],
         
         # Analyze the function
         analysis = recursive_verifier.analyze_recursive_function(
-            func_name, code, decreases
+            func_name, code, decreases, func_obj=func
         )
+        
+        # Store contracts in the verifier's registry so verify_all_recursive can find them
+        if func_name in recursive_verifier.recursive_functions:
+            recursive_verifier.recursive_functions[func_name]["_veripy_requires"] = requires
+            recursive_verifier.recursive_functions[func_name]["_veripy_ensures"] = ensures
         
         # Store analysis in function attributes for later verification
         func._veripy_analysis = analysis
@@ -476,6 +555,15 @@ def verify_recursive(requires: List[str], ensures: List[str],
         func._veripy_ensures = ensures
         func._veripy_decreases = decreases
         
+        # Register with STORE
+        try:
+            types = parse_func_types(func)
+            scope = STORE.current_scope()
+            if scope:
+                STORE.insert_func_attr(scope, func_name, types[0], types[1], types[2], requires, ensures, decreases)
+        except Exception:
+            pass # Ignore if registration fails (e.g. no scope)
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
         

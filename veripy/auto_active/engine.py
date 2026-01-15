@@ -16,8 +16,9 @@ import hashlib
 
 from veripy.parser.syntax import *
 from veripy.parser.parser import parse_assertion
-from veripy.core.verify import STORE, wp, emit_smt, fold_constraints
+from veripy.core.verify import STORE, wp, emit_smt, fold_constraints, declare_consts
 from veripy.core.transformer import StmtTranslator, Expr2Z3
+from veripy import typecheck as tc
 from veripy.typecheck import types as tc_types
 from veripy.core.prettyprint import pretty_print
 
@@ -268,61 +269,42 @@ class AutoActiveEngine:
         """
         self.statistics["solver_calls"] += 1
         
-        # Parse function and generate verification conditions
+        # Parse function and generate verification conditions (experimental).
         try:
             code = inspect.getsource(func)
+            import textwrap
+            code = textwrap.dedent(code)
             func_ast = ast.parse(code)
             target_language_ast = StmtTranslator().visit(func_ast)
             
             # Get function attributes
             scope = STORE.current_scope()
             func_attrs = STORE.get_func_attrs(scope, func.__name__)
-            sigma = func_attrs.get('inputs', {})
-            
-            # Add auto-inferred invariants for loops
-            auto_invariants = []
-            if loop_info:
-                for loop in loop_info:
-                    inferred = self.infer_loop_invariants(loop)
-                    auto_invariants.extend(inferred)
-            
-            # Combine user-specified and auto-inferred invariants
-            all_requires = requires + auto_invariants
+            scope_funcs = STORE.store[scope]['func_attrs']
+            sigma = tc.type_check_stmt(func_attrs['inputs'], scope_funcs, target_language_ast)
             
             # Generate verification condition using weakest precondition
+            user_precond = fold_constraints(requires)
             user_postcond = fold_constraints(ensures)
             (P, C) = wp(sigma, target_language_ast, user_postcond)
             
-            # Add auto-generated lemmas
-            for lemma in self.generated_lemmas:
-                lemma_expr = parse_assertion(lemma["expression"])
-                C.add(lemma_expr)
-            
-            # Create solver and check
-            check_P = fold_constraints(all_requires + [P])
-            
-            self.solver.push()
-            try:
-                translator = Expr2Z3({})
-                const = translator.visit(check_P)
-                self.solver.add(const)
-                
-                result = self.solver.check()
-                
-                if result == z3.sat:
-                    model = self.solver.model()
-                    return True, "Verification succeeded", self.statistics
-                else:
-                    # Try to get a counterexample
-                    model = self.solver.model()
-                    counterexample = {}
-                    for decl in model.decls():
-                        counterexample[decl.name()] = str(model[decl])
-                    
-                    return False, f"Verification failed: {model}", self.statistics
-                    
-            finally:
-                self.solver.pop()
+            # Do not assume auto-generated lemmas here: they are not proven.
+            # Soundness requires that only verified lemmas are added as axioms.
+            # Background arithmetic facts are already available in Z3.
+
+            # Create a fresh solver for this run.
+            solver = z3.Solver()
+            current_consts = declare_consts(sigma)
+            fn_ret_types = { n: a['returns'] for n, a in scope_funcs.items() }
+            translator = Expr2Z3(current_consts, {}, fn_ret_types)
+
+            # Check validity: (requires => WP) and side conditions.
+            check_P = BinOp(user_precond, BoolOps.Implies, P)
+            emit_smt(translator, solver, check_P, "Precondition does not imply wp")
+            for c in C:
+                emit_smt(translator, solver, BinOp(user_precond, BoolOps.Implies, c), "Side condition violated")
+
+            return True, "Verification succeeded", self.statistics
         
         except Exception as e:
             return False, f"Verification error: {str(e)}", self.statistics
@@ -401,8 +383,12 @@ class LemmaEngine:
             conclusion_expr = parse_assertion(lemma["conclusion"])
 
             # Check that premises AND NOT conclusion is unsatisfiable
+            # Essentially: premises ==> conclusion
             if premises_exprs:
                 premises_conj = fold_constraints(premises_exprs)
+                # Check: not (premises => conclusion)
+                # <=> not (not premises or conclusion)
+                # <=> premises and not conclusion
                 check_expr = BinOp(premises_conj, BoolOps.And, UnOp(BoolOps.Not, conclusion_expr))
             else:
                 check_expr = UnOp(BoolOps.Not, conclusion_expr)
@@ -421,6 +407,7 @@ class LemmaEngine:
                 return True
             else:
                 lemma["verified"] = False
+                # Optionally log counterexample
                 return False
 
         except Exception:
@@ -513,20 +500,44 @@ class TerminationChecker:
         if not decreases:
             return False, f"Recursive function '{func_name}' requires a decreases clause"
         
+        # Evaluate the decreases measure best-effort.
+        def _eval_measure(expr: str, call_args: List[Any]):
+            # Numeric literal
+            try:
+                return int(expr)
+            except Exception:
+                pass
+            # Single-argument heuristic: treat decreases as the first arg
+            if call_args:
+                first = call_args[0]
+                if isinstance(first, (int, float)):
+                    return first
+            return None
+        
+        measure = _eval_measure(decreases, args)
+        if measure is None:
+            return False, f"Unable to evaluate decreases expression '{decreases}' for termination check"
+        
         # Check if this is the first call
         if func_name not in self.decreases_info:
             self.decreases_info[func_name] = {
-                "first_call": True,
+                "first_call": False,
                 "decreases_var": decreases,
-                "previous_values": {}
+                "previous_values": {"last": measure}
             }
-            return True, "First call - termination not yet applicable"
+            return True, "First call - recorded decreases measure"
         
         info = self.decreases_info[func_name]
+        prev = info.get("previous_values", {}).get("last", None)
+        if prev is None:
+            info.setdefault("previous_values", {})["last"] = measure
+            return True, "Recorded initial decreases measure"
         
-        # For now, just verify that the decreases expression is well-formed
-        # A full implementation would track the actual values
-        return True, "Termination check passed"
+        if measure < prev:
+            info["previous_values"]["last"] = measure
+            return True, "Termination check passed (measure decreased)"
+        
+        return False, f"Termination check failed: measure {measure} does not decrease from {prev}"
 
 
 # Singleton instances

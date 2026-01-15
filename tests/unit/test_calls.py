@@ -36,7 +36,7 @@ class TestCalls(unittest.TestCase):
         vp.verify_all()
     
     def test_rec_sum(self):
-        """Test recursive sum function."""
+        """Recursive calls without decreases are rejected."""
         vp.scope('test_rec_sum')
         @verify(requires=['n >= 0'], ensures=['ans >= n'])
         def rec_sum(n: int) -> int:
@@ -44,8 +44,23 @@ class TestCalls(unittest.TestCase):
                 return 0
             return n + rec_sum(n - 1)
         
-        # Verify that the function passes verification
-        vp.verify_all()
+        with self.assertRaises(Exception):
+            vp.verify_all()  # Default now raises on failure
+
+    def test_requires_verified_callee(self):
+        """Calls to specs not yet verified should fail."""
+        vp.scope('test_requires_verified_callee')
+
+        @verify(requires=[], ensures=['ans == 0'])
+        def caller() -> int:
+            return callee()
+
+        @verify(requires=[], ensures=['ans == 0'])
+        def callee() -> int:
+            return 0
+
+        with self.assertRaises(Exception):
+            vp.verify_all()  # Default now raises on failure
 
 
 if __name__ == '__main__':

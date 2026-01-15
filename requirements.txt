@@ -3,3 +3,4 @@ pyparsing
 pytest
 pytest-cov
 apronpy
+rich

@@ -229,6 +229,19 @@ class TestTerminationChecker(unittest.TestCase):
         
         self.assertTrue(result)
         self.assertIn("First call", message)
+
+    def test_non_decreasing_measure_rejected(self):
+        """Termination requires measure to strictly decrease."""
+        # First call records measure
+        self.checker.check_termination(func_name="factorial", decreases="n", args=[3])
+        # Same measure should fail
+        result, message = self.checker.check_termination(
+            func_name="factorial",
+            decreases="n",
+            args=[3]
+        )
+        self.assertFalse(result)
+        self.assertIn("does not decrease", message)
     
     def test_termination_without_decreases_fails(self):
         """Test that termination check fails without decreases clause."""
