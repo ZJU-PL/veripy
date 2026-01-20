@@ -11,6 +11,10 @@ from veripy.core.prettyprint import pretty_print
 from veripy import typecheck as tc
 from veripy.typecheck.types import TARR, TINT, TBOOL
 
+# Global cache for uninterpreted functions to ensure consistency across verification
+# This cache is shared between function summary generation and expression translation
+_UF_CACHE = {}
+
 class VerificationStore:
     def __init__(self):
         self.store = dict()
@@ -24,6 +28,10 @@ class VerificationStore:
     
     def enable_verification(self):
         self.switch = True
+        # Clear the uninterpreted function cache when enabling verification
+        # to ensure each test starts with a fresh state
+        global _UF_CACHE
+        _UF_CACHE = {}
 
     def push(self, scope):
         # Allow reusing scope names across tests by clearing old entries
@@ -323,7 +331,7 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
 
         scope_funcs = STORE.store[scope]['func_attrs']
 
-        sigma = tc.type_check_stmt(func_attrs['inputs'], scope_funcs, target_language_ast)
+        sigma = tc.type_check_stmt(dict(func_attrs['inputs']), scope_funcs, target_language_ast)
 
         # Add refinement predicates from parameter types into the precondition.
         param_ref_preds = []
@@ -423,7 +431,7 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
         def _ret_base(ty):
             return ty.base_type if isinstance(ty, tc.types.TREFINED) else ty
         fn_ret_types = { n: _ret_base(a['returns']) for n, a in scope_funcs.items() }
-        translator = Expr2Z3(current_consts, old_consts, fn_ret_types)
+        translator = Expr2Z3(current_consts, old_consts, fn_ret_types, _UF_CACHE)
 
         # Add modular function-summary axioms for all known functions in scope.
         # For each function f(x1..xn) with requires R and ensures E, assert:
@@ -452,13 +460,19 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                 bound_vars = [z3.Const(n, s) for n, s in zip(param_names, in_sorts)]
                 ax_name_dict = {n: v for n, v in zip(param_names, bound_vars)}
                 if bound_vars:
-                    uf = z3.Function(f'uf_{fname}', *in_sorts, ret_sort)
+                    # Use global cache to ensure consistent uf references
+                    cache_key = (f'uf_{fname}', tuple(in_sorts), ret_sort)
+                    if cache_key in _UF_CACHE:
+                        uf = _UF_CACHE[cache_key]
+                    else:
+                        uf = z3.Function(f'uf_{fname}', *in_sorts, ret_sort)
+                        _UF_CACHE[cache_key] = uf
                     ax_name_dict['ans'] = uf(*bound_vars)
                 else:
                     # Nullary function: represent as a constant
                     ax_name_dict['ans'] = z3.Const(f'uf_{fname}', ret_sort)
 
-                ax_translator = Expr2Z3(ax_name_dict, {}, fn_ret_types)
+                ax_translator = Expr2Z3(ax_name_dict, {}, fn_ret_types, _UF_CACHE)
                 req_expr = fold_constraints(attrs.get('requires', []))
                 ens_expr = fold_constraints(attrs.get('ensures', []))
                 req_z3 = ax_translator.visit(req_expr)

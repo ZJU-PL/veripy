@@ -167,14 +167,17 @@ class TestLoopStatements(unittest.TestCase):
         self.assertIsInstance(result, Continue)
     
     def test_for_loop_range(self):
-        """Test for loop with range - transformed to While."""
+        """Test for loop with range - transformed to While loop with initialization."""
         translator = StmtTranslator()
         code = "for i in range(10):\n    x = i"
         tree = ast.parse(code, mode='exec')
         result = translator.visit(tree.body[0])
-        # For loops are transformed to While loops for verification
-        self.assertIsInstance(result, While)
-        self.assertIn('i', str(result.cond))
+        # For loops are transformed to Seq containing initialization and While loop
+        # The Seq preserves the semantics: init; while cond: body
+        self.assertIsInstance(result, Seq)
+        # The Seq should contain a While loop
+        self.assertIsInstance(result.s2, While)
+        self.assertIn('i', str(result.s2.cond))
 
 
 class TestWithStatement(unittest.TestCase):

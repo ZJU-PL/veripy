@@ -1498,13 +1498,14 @@ class Expr2Z3:
     """
     
     def __init__(self, name_dict: dict, old_dict: dict = None, 
-                 func_returns: dict = None, class_fields: dict = None):
+                 func_returns: dict = None, class_fields: dict = None,
+                 uf_cache: dict = None):
         self.name_dict = name_dict
         self.old_dict = old_dict or {}
         self.func_returns = func_returns or {}
         self.class_fields = class_fields or {}  # {class_name: {field_name: z3_sort}}
-        # Cache uninterpreted functions/consts by (name, arg_sorts, ret_sort)
-        self._uf_cache = {}
+        # Use provided cache or create new one - for consistent uf references across verification
+        self._uf_cache = uf_cache if uf_cache is not None else {}
         # Cache for list-comprehension placeholders
         self._listcomp_cache = {}
         

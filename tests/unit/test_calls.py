@@ -1,6 +1,7 @@
 import unittest
 import veripy as vp
 from veripy import verify, invariant
+from veripy.core.verify import STORE
 
 
 class TestCalls(unittest.TestCase):
@@ -9,6 +10,16 @@ class TestCalls(unittest.TestCase):
     def setUp(self):
         """Set up verification for each test."""
         vp.enable_verification()
+    
+    def tearDown(self):
+        """Clean up verification state after each test."""
+        # Reset the STORE to prevent cross-test contamination
+        STORE.store.clear()
+        STORE.scope.clear()
+        STORE.func_attrs_global.clear()
+        STORE.pre_states.clear()
+        STORE.current_func = None
+        STORE.self_call = False
     
     def test_inc(self):
         """Test simple increment function."""
