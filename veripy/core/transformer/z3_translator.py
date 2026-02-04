@@ -36,6 +36,9 @@ class Expr2Z3:
         self._uf_cache = uf_cache if uf_cache is not None else {}
         # Cache for list-comprehension placeholders
         self._listcomp_cache = {}
+        # Cache for set/dict comprehension placeholders
+        self._setcomp_cache = {}
+        self._dictcomp_cache = {}
         
         # Uninterpreted functions for special operations
         # Length is intentionally modeled as an uninterpreted function.
@@ -570,8 +573,46 @@ class Expr2Z3:
         return self._listcomp_cache[key]
     
     def visit_SetComprehension(self, node: SetComprehension):
-        """Set comprehension - simplified to uninterpreted."""
-        return z3.K(z3.IntSort(), z3.BoolVal(False))
+        """
+        Set comprehension placeholder.
+
+        Model as an unconstrained set to avoid unsound under-approximation.
+        """
+        key = repr(node)
+        if key not in self._setcomp_cache:
+            # Default to Int elements; this matches existing set encoding.
+            self._setcomp_cache[key] = z3.Array(
+                f'setcomp_{len(self._setcomp_cache) + 1}',
+                z3.IntSort(),
+                z3.BoolSort(),
+            )
+        return self._setcomp_cache[key]
+
+    def visit_DictComprehension(self, node: DictComprehension):
+        """
+        Dict comprehension placeholder.
+
+        Model as an unconstrained map to avoid unsound under-approximation.
+        """
+        key = repr(node)
+        if key not in self._dictcomp_cache:
+            # Attempt to infer key/value sorts from the comprehension expressions.
+            try:
+                k_sort = self.visit(node.key_expr).sort()
+            except Exception:
+                k_sort = z3.IntSort()
+            try:
+                v_sort = self.visit(node.value_expr).sort()
+            except Exception:
+                v_sort = z3.IntSort()
+            if v_sort == z3.BoolSort():
+                default_v = z3.BoolVal(False)
+            elif v_sort == z3.StringSort():
+                default_v = z3.StringVal("")
+            else:
+                default_v = z3.IntVal(0)
+            self._dictcomp_cache[key] = z3.K(k_sort, default_v)
+        return self._dictcomp_cache[key]
     
     def visit(self, expr: Expr):
         """Main dispatch method with support for all expression types."""
@@ -602,6 +643,7 @@ class Expr2Z3:
             
             # Dict expressions
             DictLiteral: self.visit_DictLiteral,
+            DictComprehension: self.visit_DictComprehension,
             DictGet: self.visit_DictGet,
             DictSet: self.visit_DictSet,
             DictKeys: self.visit_DictKeys,

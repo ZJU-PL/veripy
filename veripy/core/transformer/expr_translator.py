@@ -313,9 +313,8 @@ class ExprTranslator:
             else:
                 predicate = BinOp(predicate, BoolOps.And, cond)
         
-        # For simplicity, we'll create a dict with placeholder and transform later
-        # This is a limitation - full dict comprehension support requires more work
-        return DictLiteral([key_expr], [value_expr])
+        # Preserve comprehension structure so later stages can model it safely.
+        return DictComprehension(key_expr, value_expr, element_var, iterable, predicate)
     
     def visit_List(self, node):
         """Handle list literals: [1, 2, 3]"""

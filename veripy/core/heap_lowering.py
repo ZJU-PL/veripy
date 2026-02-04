@@ -312,6 +312,14 @@ class HeapLowerer:
                 self.lower_expr(e.source, rewrite_user_calls=rewrite_user_calls),
                 self.lower_expr(e.predicate, rewrite_user_calls=rewrite_user_calls) if e.predicate else None,
             )
+        if isinstance(e, DictComprehension):
+            return DictComprehension(
+                self.lower_expr(e.key_expr, rewrite_user_calls=rewrite_user_calls),
+                self.lower_expr(e.value_expr, rewrite_user_calls=rewrite_user_calls),
+                e.element_var,
+                self.lower_expr(e.iterable, rewrite_user_calls=rewrite_user_calls),
+                self.lower_expr(e.predicate, rewrite_user_calls=rewrite_user_calls) if e.predicate else None,
+            )
         if isinstance(e, Quantification):
             # Quantifiers are pure; just lower inside the body.
             # Bound variables are plain Vars and should not be rewritten.
@@ -513,6 +521,16 @@ def _expr_in_old_state(e: Expr) -> Expr:
             new_bound = set(bound)
             new_bound.add(expr.element_var.name)
             return SetComprehension(expr.element_var, go(expr.source, bound), go(expr.predicate, new_bound) if expr.predicate else None)
+        if isinstance(expr, DictComprehension):
+            new_bound = set(bound)
+            new_bound.add(expr.element_var.name)
+            return DictComprehension(
+                go(expr.key_expr, new_bound),
+                go(expr.value_expr, new_bound),
+                expr.element_var,
+                go(expr.iterable, bound),
+                go(expr.predicate, new_bound) if expr.predicate else None,
+            )
         if isinstance(expr, FieldAccess):
             return FieldAccess(go(expr.obj, bound), expr.field)
         if isinstance(expr, MethodCall):

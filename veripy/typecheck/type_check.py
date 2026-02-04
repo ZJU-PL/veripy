@@ -446,6 +446,11 @@ def type_infer_expr(sigma: dict, func_sigma : dict, expr: Expr):
     if isinstance(expr, SetComprehension):
         elem_ty = type_infer_expr(sigma, func_sigma, expr.source)
         return ty.TSET(elem_ty if elem_ty != ty.TANY else ty.TANY)
+    if isinstance(expr, DictComprehension):
+        key_ty = type_infer_expr(sigma, func_sigma, expr.key_expr)
+        val_ty = type_infer_expr(sigma, func_sigma, expr.value_expr)
+        return ty.TDICT(key_ty if key_ty != ty.TANY else ty.TANY,
+                        val_ty if val_ty != ty.TANY else ty.TANY)
     if isinstance(expr, FieldAccess):
         return ty.TANY
     if isinstance(expr, MethodCall):

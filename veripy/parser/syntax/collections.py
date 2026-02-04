@@ -95,6 +95,29 @@ class DictLiteral(Expr):
         return result
 
 
+class DictComprehension(Expr):
+    """Dictionary comprehension: {k: v for x in iter if cond}"""
+    def __init__(self, key_expr: Expr, value_expr: Expr, element_var: Var,
+                 iterable: Expr, predicate: Optional[Expr] = None):
+        self.key_expr = key_expr
+        self.value_expr = value_expr
+        self.element_var = element_var
+        self.iterable = iterable
+        self.predicate = predicate
+
+    def __repr__(self):
+        pred_str = f' if {self.predicate}' if self.predicate else ''
+        return f'(DictComprehension {{{self.key_expr}: {self.value_expr} for {self.element_var} in {self.iterable}{pred_str}}})'
+
+    def variables(self):
+        result = self.key_expr.variables().union(self.value_expr.variables())
+        result.update(self.iterable.variables())
+        if self.predicate:
+            result.update(self.predicate.variables())
+        result.discard(self.element_var.name)
+        return result
+
+
 class DictGet(Expr):
     """Get value from dict: d[key]"""
     def __init__(self, dict_expr: Expr, key: Expr, default: Optional[Expr] = None):

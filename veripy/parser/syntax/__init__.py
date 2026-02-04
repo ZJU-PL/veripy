@@ -37,7 +37,7 @@ __all__ = [
     'ClassDef', 'MethodDef',
     # Collections
     'SetLiteral', 'SetOp', 'SetCardinality', 'SetComprehension',
-    'DictLiteral', 'DictGet', 'DictSet', 'DictKeys', 'DictValues', 'DictContains',
+    'DictLiteral', 'DictComprehension', 'DictGet', 'DictSet', 'DictKeys', 'DictValues', 'DictContains',
     'ListComprehension',
     # Strings
     'StringLiteral', 'StringConcat', 'StringLength', 'StringIndex',

@@ -381,6 +381,13 @@ def _safe_eval_expr(expr: Expr) -> Expr:
                 out = _and_expr(out, safe(e.predicate))
             return out
 
+        if isinstance(e, DictComprehension):
+            out = _and_expr(safe(e.key_expr), safe(e.value_expr))
+            out = _and_expr(out, safe(e.iterable))
+            if e.predicate:
+                out = _and_expr(out, safe(e.predicate))
+            return out
+
         # Unknown expression forms: be permissive (best-effort).
         return TRUE
 
@@ -485,6 +492,16 @@ def wp(sigma, stmt, Q):
                 return SetLiteral([go(x, bound) for x in e.elements])
             if isinstance(e, DictLiteral):
                 return DictLiteral([go(x, bound) for x in e.keys], [go(x, bound) for x in e.values])
+            if isinstance(e, DictComprehension):
+                new_bound = set(bound)
+                new_bound.add(e.element_var.name)
+                return DictComprehension(
+                    go(e.key_expr, new_bound),
+                    go(e.value_expr, new_bound),
+                    e.element_var,
+                    go(e.iterable, bound),
+                    go(e.predicate, new_bound) if e.predicate else None,
+                )
             if isinstance(e, SetOp):
                 return SetOp(go(e.left, bound), e.op, go(e.right, bound))
             if isinstance(e, SetCardinality):
@@ -522,21 +539,10 @@ def wp(sigma, stmt, Q):
 
     def wp_assign_x(stmt: Assign, Q):
         lhs = stmt.var
-        # Support tuple destructuring by expanding into sequential substitutions.
+        # Tuple destructuring is handled in the statement translator.
+        # Seeing a tuple LHS here is an internal error and would be unsound.
         if isinstance(lhs, (list, tuple)):
-            q_curr = Q
-            # Evaluate right-hand side elements lazily via Subscripting the tuple/array expression
-            for idx, target in reversed(list(enumerate(lhs))):
-                if isinstance(target, Var):
-                    tname = target.name
-                elif isinstance(target, str):
-                    tname = target
-                else:
-                    raise Exception(f'Unsupported tuple target: {target!r}')
-                # model rhs element as Subscript(stmt.expr, idx)
-                element_expr = Subscript(stmt.expr, Literal(VInt(idx)))
-                q_curr = subst(tname, element_expr, q_curr)
-            return (q_curr, [])
+            raise Exception('Tuple unpacking is not supported at this stage (unsound without length checks)')
 
         if isinstance(lhs, Var):
             lhs = lhs.name
@@ -600,8 +606,8 @@ def wp(sigma, stmt, Q):
         Seq:    lambda: wp_seq(sigma, stmt, Q),
         If:     lambda: wp_if(sigma, stmt, Q),
         While:  lambda: wp_while(sigma, stmt, Q),
-        Continue: lambda: (Q, []),
-        Break: lambda: (Q, []),
+        Continue: lambda: raise_exception("continue is not supported (unsound in current WP encoding)"),
+        Break: lambda: raise_exception("break is not supported (unsound in current WP encoding)"),
         Havoc:  lambda: (Quantification(Var(stmt.var + '$0'), sigma[stmt.var], subst(stmt.var, Var(stmt.var + '$0'), Q)), [])
     }.get(type(stmt), lambda: raise_exception(f'wp not implemented for {type(stmt)}'))()
 
@@ -777,6 +783,104 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
         pre_with_refinements = lowerer.lower_expr(pre_with_refinements, rewrite_user_calls=True)
         user_postcond = lowerer.lower_expr(user_postcond, rewrite_user_calls=True)
 
+        def _reject_method_calls_expr(e: Expr):
+            if isinstance(e, (Var, Literal, StringLiteral)):
+                return
+            if isinstance(e, UnOp):
+                _reject_method_calls_expr(e.e)
+                return
+            if isinstance(e, BinOp):
+                _reject_method_calls_expr(e.e1)
+                _reject_method_calls_expr(e.e2)
+                return
+            if isinstance(e, Subscript):
+                _reject_method_calls_expr(e.var)
+                _reject_method_calls_expr(e.subscript)
+                return
+            if isinstance(e, Store):
+                _reject_method_calls_expr(e.arr)
+                _reject_method_calls_expr(e.idx)
+                _reject_method_calls_expr(e.val)
+                return
+            if isinstance(e, FunctionCall):
+                if isinstance(e.func_name, Expr):
+                    _reject_method_calls_expr(e.func_name)
+                for a in e.args:
+                    if isinstance(a, Expr):
+                        _reject_method_calls_expr(a)
+                return
+            if isinstance(e, Quantification):
+                _reject_method_calls_expr(e.expr)
+                return
+            if isinstance(e, Old):
+                _reject_method_calls_expr(e.expr)
+                return
+            if isinstance(e, SetLiteral):
+                for x in e.elements:
+                    _reject_method_calls_expr(x)
+                return
+            if isinstance(e, DictLiteral):
+                for x in e.keys:
+                    _reject_method_calls_expr(x)
+                for x in e.values:
+                    _reject_method_calls_expr(x)
+                return
+            if isinstance(e, DictComprehension):
+                _reject_method_calls_expr(e.key_expr)
+                _reject_method_calls_expr(e.value_expr)
+                _reject_method_calls_expr(e.iterable)
+                if e.predicate:
+                    _reject_method_calls_expr(e.predicate)
+                return
+            if isinstance(e, SetOp):
+                _reject_method_calls_expr(e.left)
+                _reject_method_calls_expr(e.right)
+                return
+            if isinstance(e, SetCardinality):
+                _reject_method_calls_expr(e.set_expr)
+                return
+            if isinstance(e, DictGet):
+                _reject_method_calls_expr(e.dict_expr)
+                _reject_method_calls_expr(e.key)
+                if e.default:
+                    _reject_method_calls_expr(e.default)
+                return
+            if isinstance(e, DictSet):
+                _reject_method_calls_expr(e.dict_expr)
+                _reject_method_calls_expr(e.key)
+                _reject_method_calls_expr(e.value)
+                return
+            if isinstance(e, DictKeys):
+                _reject_method_calls_expr(e.dict_expr)
+                return
+            if isinstance(e, DictValues):
+                _reject_method_calls_expr(e.dict_expr)
+                return
+            if isinstance(e, DictContains):
+                _reject_method_calls_expr(e.dict_expr)
+                _reject_method_calls_expr(e.key)
+                return
+            if isinstance(e, FieldAccess):
+                _reject_method_calls_expr(e.obj)
+                return
+            if isinstance(e, MethodCall):
+                raise Exception("Method calls are not supported (unsound without a purity/heap model)")
+            if isinstance(e, ListComprehension):
+                _reject_method_calls_expr(e.element_expr)
+                _reject_method_calls_expr(e.iterable)
+                if e.predicate:
+                    _reject_method_calls_expr(e.predicate)
+                return
+            if isinstance(e, SetComprehension):
+                _reject_method_calls_expr(e.source)
+                if e.predicate:
+                    _reject_method_calls_expr(e.predicate)
+                return
+            return
+
+        _reject_method_calls_expr(pre_with_refinements)
+        _reject_method_calls_expr(user_postcond)
+
         # Require that contracts are well-defined (no Python exceptions) under
         # the declared precondition.
         pre_with_refinements = _and_expr(_safe_eval_expr(pre_with_refinements), pre_with_refinements)
@@ -871,10 +975,7 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                     visit_expr(e.obj, False)
                     return
                 if isinstance(e, MethodCall):
-                    visit_expr(e.obj, False)
-                    for a in e.args:
-                        visit_expr(a, False)
-                    return
+                    raise Exception("Method calls are not supported (unsound without a purity/heap model)")
                 if isinstance(e, ListComprehension):
                     visit_expr(e.element_expr, False)
                     visit_expr(e.iterable, False)
@@ -883,6 +984,13 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                     return
                 if isinstance(e, SetComprehension):
                     visit_expr(e.source, False)
+                    if e.predicate:
+                        visit_expr(e.predicate, False)
+                    return
+                if isinstance(e, DictComprehension):
+                    visit_expr(e.key_expr, False)
+                    visit_expr(e.value_expr, False)
+                    visit_expr(e.iterable, False)
                     if e.predicate:
                         visit_expr(e.predicate, False)
                     return
@@ -1107,6 +1215,13 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                     return
                 if isinstance(e, SetComprehension):
                     collect_expr(e.source)
+                    if e.predicate:
+                        collect_expr(e.predicate)
+                    return
+                if isinstance(e, DictComprehension):
+                    collect_expr(e.key_expr)
+                    collect_expr(e.value_expr)
+                    collect_expr(e.iterable)
                     if e.predicate:
                         collect_expr(e.predicate)
                     return

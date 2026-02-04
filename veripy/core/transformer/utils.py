@@ -124,6 +124,14 @@ def subst(this: str, withThis: Expr, inThis: Expr) -> Expr:
             subst(this, withThis, inThis.source),
             subst(this, withThis, inThis.predicate) if inThis.predicate else None
         )
+    if isinstance(inThis, DictComprehension):
+        return DictComprehension(
+            subst(this, withThis, inThis.key_expr),
+            subst(this, withThis, inThis.value_expr),
+            inThis.element_var,
+            subst(this, withThis, inThis.iterable),
+            subst(this, withThis, inThis.predicate) if inThis.predicate else None,
+        )
     if isinstance(inThis, DictGet):
         return DictGet(
             subst(this, withThis, inThis.dict_expr),

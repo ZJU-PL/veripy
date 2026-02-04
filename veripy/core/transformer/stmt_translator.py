@@ -112,27 +112,37 @@ class StmtTranslator:
     def visit_Assign(self, node):
         # Support tuple unpacking (a, *b, c = ...)
         if isinstance(node.targets[0], ast.Tuple):
-            # Represent unpacking explicitly so the verifier can fail closed
-            # (silently dropping these updates would be unsound).
-            def _tgt(t):
+            # Restrict tuple unpacking to tuple/list literals so RHS length is known.
+            targets = []
+            for t in node.targets[0].elts:
                 if isinstance(t, ast.Starred):
-                    inner = t.value.id if isinstance(t.value, ast.Name) else str(t.value)
-                    return ('*', inner)
+                    raise_exception('Starred tuple unpacking is not supported')
                 if isinstance(t, ast.Name):
-                    return t.id
-                return str(t)
-            unpack_target = tuple(_tgt(t) for t in node.targets[0].elts)
-            if isinstance(node.value, ast.List):
-                expr = FunctionCall(Var('__list_lit'), [self.visit(e) for e in node.value.elts])
-            elif isinstance(node.value, ast.Dict):
-                flat = []
-                for k, v in zip(node.value.keys, node.value.values):
-                    flat.append(self.visit(k))
-                    flat.append(self.visit(v))
-                expr = FunctionCall(Var('__dict_lit'), flat)
-            else:
-                expr = self.visit(node.value)
-            return Assign(unpack_target, expr)
+                    targets.append(t.id)
+                else:
+                    raise_exception('Only simple name targets are supported in tuple unpacking')
+
+            if not isinstance(node.value, (ast.Tuple, ast.List)):
+                raise_exception('Tuple unpacking only supported for tuple/list literals')
+            if any(isinstance(e, ast.Starred) for e in node.value.elts):
+                raise_exception('Starred tuple unpacking on RHS is not supported')
+            if len(node.value.elts) != len(targets):
+                raise_exception('Tuple unpacking length mismatch')
+
+            # Evaluate all RHS elements left-to-right into temporaries, then assign.
+            stmts = []
+            temps = []
+            for e in node.value.elts:
+                expr = self.visit(e)
+                lifted, expr2 = self._lift_calls_expr(expr)
+                tmp = self._fresh_tmp("__unpack_tmp")
+                stmts.extend(lifted)
+                stmts.append(Assign(tmp, expr2))
+                temps.append(tmp)
+
+            for tname, tmp in zip(targets, temps):
+                stmts.append(Assign(tname, Var(tmp)))
+            return self._seq_from(stmts)
         else:
             target = self.visit(node.targets[0])
         # Translate RHS (list literals need special handling in statement context).
@@ -249,18 +259,34 @@ class StmtTranslator:
         # Handle range(n)
         if isinstance(iterable, ast.Call):
             if isinstance(iterable.func, ast.Name) and iterable.func.id == 'range':
+                def _int_literal(node):
+                    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                        return node.value
+                    if isinstance(node, ast.Num) and isinstance(node.n, int):
+                        return node.n
+                    return None
+
                 start = Literal(VInt(0))
                 stop = self.visit(iterable.args[0])
                 step = Literal(VInt(1))
+                step_val = 1
                 if len(iterable.args) > 1:
                     start = self.visit(iterable.args[0])
                     stop = self.visit(iterable.args[1])
                 if len(iterable.args) > 2:
-                    step = self.visit(iterable.args[2])
+                    step_val = _int_literal(iterable.args[2])
+                    if step_val is None:
+                        raise_exception('range() step must be a constant integer for verification soundness')
+                    if step_val == 0:
+                        raise_exception('range() step cannot be zero')
+                    step = Literal(VInt(step_val))
                 
                 # Create: i = start; while i < stop: body; i += step
                 init = Assign(iter_var, start)
-                cond = BinOp(Var(iter_var), CompOps.Lt, stop)
+                if step_val < 0:
+                    cond = BinOp(Var(iter_var), CompOps.Gt, stop)
+                else:
+                    cond = BinOp(Var(iter_var), CompOps.Lt, stop)
                 body_stmts = [self.visit(s) for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name) and s.value.func.id == 'invariant')]
                 body = body_stmts[0] if body_stmts else Skip()
                 for s in body_stmts[1:]:
@@ -428,13 +454,14 @@ class StmtTranslator:
         # We translate those to FunctionCall expressions.
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            func_name = node.func.attr
-        else:
-            raise_exception(f'Unsupported call func: {ast.dump(node.func)}')
-
-        args = [self.visit(arg) for arg in node.args]
-        return FunctionCall(Var(func_name), args)
+            args = [self.visit(arg) for arg in node.args]
+            return FunctionCall(Var(func_name), args)
+        if isinstance(node.func, ast.Attribute):
+            obj = self.visit(node.func.value)
+            method_name = node.func.attr
+            args = [self.visit(arg) for arg in node.args]
+            return MethodCall(obj, method_name, args)
+        raise_exception(f'Unsupported call func: {ast.dump(node.func)}')
     
     def visit_IfExp(self, node):
         """Handle ternary expressions (x if cond else y)."""
