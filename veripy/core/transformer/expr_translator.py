@@ -50,6 +50,8 @@ class ExprTranslator:
         return Literal(VInt(node.n))
     
     def visit_NameConstant(self, node):
+        if node.value is None:
+            raise Exception('None is not supported in verification')
         return Literal(VBool(node.value))
     
     def visit_Constant(self, node):
@@ -61,8 +63,7 @@ class ExprTranslator:
         elif isinstance(node.value, str):
             return StringLiteral(node.value)
         elif node.value is None:
-            # Represent None as a symbolic variable to keep translation simple
-            return Var('None')
+            raise Exception('None is not supported in verification')
         else:
             raise Exception(f'Unsupported constant: {node.value}')
     
@@ -93,8 +94,9 @@ class ExprTranslator:
             ast.Eq: lambda: BinOp(lv, CompOps.Eq, rv),
             ast.NotEq: lambda: BinOp(lv, CompOps.Neq, rv),
             ast.In: lambda: BinOp(lv, CompOps.In, rv),
+            ast.NotIn: lambda: BinOp(lv, CompOps.NotIn, rv),
         }
-        return op_map.get(type(op), lambda: raise_exception(f'Not Supported: {op}'))()
+        return op_map.get(type(op), lambda: raise_exception(f'Unsupported comparison operator: {type(op).__name__}'))()
     
     def visit_BinOp(self, node):
         lv = self.visit(node.left)
@@ -104,11 +106,11 @@ class ExprTranslator:
             ast.Add: lambda: BinOp(lv, ArithOps.Add, rv),
             ast.Sub: lambda: BinOp(lv, ArithOps.Minus, rv),
             ast.Mult: lambda: BinOp(lv, ArithOps.Mult, rv),
-            ast.Div: lambda: BinOp(lv, ArithOps.IntDiv, rv),
+            ast.FloorDiv: lambda: BinOp(lv, ArithOps.IntDiv, rv),
             ast.Mod: lambda: BinOp(lv, ArithOps.Mod, rv),
             ast.BitOr: lambda: BinOp(lv, BoolOps.Or, rv),  # used for union types
         }
-        return op_map.get(type(node.op), lambda: raise_exception(f'Not Supported: {node.op}'))()
+        return op_map.get(type(node.op), lambda: raise_exception(f'Unsupported binary operator: {type(node.op).__name__}'))()
     
     def visit_UnaryOp(self, node):
         v = self.visit(node.operand)
@@ -116,7 +118,7 @@ class ExprTranslator:
             ast.USub: lambda: UnOp(ArithOps.Neg, v),
             ast.Not: lambda: UnOp(BoolOps.Not, v),
         }
-        return op_map.get(type(node.op), lambda: raise_exception(f'Not Supported {node.op}'))()
+        return op_map.get(type(node.op), lambda: raise_exception(f'Unsupported unary operator: {type(node.op).__name__}'))()
     
     def visit_Index(self, node):
         return self.visit(node.value)

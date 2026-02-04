@@ -39,6 +39,8 @@ class Expr2Z3:
         # Cache for set/dict comprehension placeholders
         self._setcomp_cache = {}
         self._dictcomp_cache = {}
+        # Cache for dict values placeholders
+        self._dictvalues_cache = {}
         
         # Uninterpreted functions for special operations
         # Length is intentionally modeled as an uninterpreted function.
@@ -369,7 +371,13 @@ class Expr2Z3:
         
         if fname == 'str':
             assert len(node.args) == 1
-            return z3.StringVal(str(arg_terms[0]))
+            # Model string conversion as an uninterpreted function to avoid
+            # fixing a concrete string for symbolic terms.
+            arg0 = arg_terms[0]
+            key = ('str_of', (arg0.sort(),), z3.StringSort())
+            if key not in self._uf_cache:
+                self._uf_cache[key] = z3.Function('str_of', arg0.sort(), z3.StringSort())
+            return self._uf_cache[key](arg0)
         
         # Uninterpreted functions/consts for user functions and verifier summaries.
         summary = _parse_summary_uf(fname)
@@ -512,11 +520,15 @@ class Expr2Z3:
         return self._dom_map_fun(d)
     
     def visit_DictValues(self, node: DictValues):
-        # Values are harder - we need to extract all values from the map
-        # For now, return uninterpreted
-        d = self.visit(node.dict_expr)
-        # This is a simplification
-        return d
+        # Values are harder - model as an unconstrained set.
+        key = repr(node)
+        if key not in self._dictvalues_cache:
+            self._dictvalues_cache[key] = z3.Array(
+                f'dictvals_{len(self._dictvalues_cache) + 1}',
+                z3.IntSort(),
+                z3.BoolSort(),
+            )
+        return self._dictvalues_cache[key]
     
     def visit_DictContains(self, node: DictContains):
         d = self.visit(node.dict_expr)

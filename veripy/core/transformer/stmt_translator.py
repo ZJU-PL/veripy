@@ -19,6 +19,10 @@ class StmtTranslator:
         self._tmp_idx = 0
         # Reuse expression translator so stmt-context literals/exprs stay consistent.
         self._expr_translator = ExprTranslator()
+        # Track whether we are inside control-flow (if/while/for) to restrict returns.
+        self._in_control = 0
+        # Track whether returns are allowed (only at top-level function body).
+        self._allow_return = False
 
     def _fresh_tmp(self, prefix: str = "__call_tmp") -> str:
         self._tmp_idx += 1
@@ -197,8 +201,12 @@ class StmtTranslator:
     def visit_If(self, node):
         cond = self.visit(node.test)
         # Translate full statement lists for each branch (dropping statements is unsound).
-        lb = self.visit_seq(node.body) if node.body else Skip()
-        rb = self.visit_seq(node.orelse) if node.orelse else Skip()
+        self._in_control += 1
+        try:
+            lb = self.visit_seq(node.body) if node.body else Skip()
+            rb = self.visit_seq(node.orelse) if node.orelse else Skip()
+        finally:
+            self._in_control -= 1
         return If(cond, lb, rb)
     
     def visit_While(self, node):
@@ -231,7 +239,11 @@ class StmtTranslator:
         
         cond = self.visit(node.test)
         # Translate the whole body, skipping invariant(...) annotation calls.
-        body_stmts = [self.visit(s) for s in node.body if not _is_invariant_call(s)]
+        self._in_control += 1
+        try:
+            body_stmts = [self.visit(s) for s in node.body if not _is_invariant_call(s)]
+        finally:
+            self._in_control -= 1
         body = self.visit_seq([])  # default Skip()
         if body_stmts:
             body = body_stmts[0]
@@ -287,7 +299,11 @@ class StmtTranslator:
                     cond = BinOp(Var(iter_var), CompOps.Gt, stop)
                 else:
                     cond = BinOp(Var(iter_var), CompOps.Lt, stop)
-                body_stmts = [self.visit(s) for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name) and s.value.func.id == 'invariant')]
+                self._in_control += 1
+                try:
+                    body_stmts = [self.visit(s) for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name) and s.value.func.id == 'invariant')]
+                finally:
+                    self._in_control -= 1
                 body = body_stmts[0] if body_stmts else Skip()
                 for s in body_stmts[1:]:
                     body = Seq(body, s)
@@ -315,6 +331,8 @@ class StmtTranslator:
     
     def visit_Return(self, node):
         expr = self.visit(node.value) if node.value else None
+        if self._in_control > 0:
+            raise_exception('return is only supported at top-level function body (not inside control flow)')
         # Model a return by assigning to the implicit result variable `ans`
         if not expr:
             return Skip()
@@ -374,7 +392,7 @@ class StmtTranslator:
         elif isinstance(node.value, str):
             return StringLiteral(node.value)
         elif node.value is None:
-            return Var('None')
+            raise_exception('None is not supported in verification')
         raise_exception(f'Unsupported constant: {node.value!r}')
     
     def visit_Num(self, node):
@@ -387,6 +405,8 @@ class StmtTranslator:
     
     def visit_NameConstant(self, node):
         """Handle name constants (True, False, None)."""
+        if node.value is None:
+            raise_exception('None is not supported in verification')
         return Literal(VBool(node.value))
 
     def visit_List(self, node):
@@ -417,8 +437,11 @@ class StmtTranslator:
             ast.Eq: CompOps.Eq,
             ast.NotEq: CompOps.Neq,
             ast.In: CompOps.In,
+            ast.NotIn: CompOps.NotIn,
         }
-        op = op_map.get(type(node.ops[0]), CompOps.Eq)
+        op = op_map.get(type(node.ops[0]))
+        if op is None:
+            raise_exception(f'Unsupported comparison operator: {type(node.ops[0]).__name__}')
         return BinOp(left, op, right)
     
     def visit_BinOp(self, node):
@@ -430,11 +453,12 @@ class StmtTranslator:
             ast.Add: ArithOps.Add,
             ast.Sub: ArithOps.Minus,
             ast.Mult: ArithOps.Mult,
-            ast.Div: ArithOps.IntDiv,
             ast.FloorDiv: ArithOps.IntDiv,
             ast.Mod: ArithOps.Mod,
         }
-        op = op_map.get(type(node.op), ArithOps.Add)
+        op = op_map.get(type(node.op))
+        if op is None:
+            raise_exception(f'Unsupported binary operator: {type(node.op).__name__}')
         return BinOp(left, op, right)
     
     def visit_UnaryOp(self, node):
@@ -445,8 +469,7 @@ class StmtTranslator:
             return UnOp(ArithOps.Neg, operand)
         elif isinstance(node.op, ast.Not):
             return UnOp(BoolOps.Not, operand)
-        else:
-            return operand
+        raise_exception(f'Unsupported unary operator: {type(node.op).__name__}')
     
     def visit_Call(self, node):
         """Handle function calls."""
@@ -483,13 +506,13 @@ class StmtTranslator:
             ast.Add: ArithOps.Add,
             ast.Sub: ArithOps.Minus,
             ast.Mult: ArithOps.Mult,
-            ast.Div: ArithOps.IntDiv,
             ast.FloorDiv: ArithOps.IntDiv,
             ast.Mod: ArithOps.Mod,
-            ast.Pow: ArithOps.Mult,  # Approximation
         }
         
-        op = op_map.get(type(node.op), ArithOps.Add)
+        op = op_map.get(type(node.op))
+        if op is None:
+            raise_exception(f'Unsupported augmented assignment operator: {type(node.op).__name__}')
         return AugAssign(var, op, expr)
 
     def visit_Try(self, node):
@@ -570,7 +593,12 @@ class StmtTranslator:
     def visit_FunctionDef(self, node):
         """Translate function definitions by visiting their bodies."""
         # We ignore decorators and parameters here; the verifier supplies specs.
-        return self.visit_seq(node.body)
+        prev_allow = self._allow_return
+        self._allow_return = True
+        try:
+            return self.visit_seq(node.body)
+        finally:
+            self._allow_return = prev_allow
 
     def visit_AsyncFunctionDef(self, node):
         """Handle async function definitions."""
@@ -742,6 +770,12 @@ class StmtTranslator:
         """Convert a list of statements to a sequence."""
         if not stmts:
             return Skip()
+        if self._allow_return:
+            for st in stmts[:-1]:
+                if isinstance(st, ast.Return):
+                    raise_exception('return must be the last statement in a function body')
+            if any(isinstance(st, ast.Return) for st in stmts) and self._in_control > 0:
+                raise_exception('return is only supported at top-level function body (not inside control flow)')
         result = None
         for stmt in stmts:
             stmt_translated = self.visit(stmt)

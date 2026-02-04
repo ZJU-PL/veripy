@@ -210,6 +210,8 @@ def type_infer_BinOp(sigma, func_sigma, expr: BinOp):
                 l_ty = l_ty.base_type
             if isinstance(r_ty, ty.TREFINED):
                 r_ty = r_ty.base_type
+            if isinstance(l_ty, (ty.TARR, ty.TDICT)) or isinstance(r_ty, (ty.TARR, ty.TDICT)):
+                raise TypeError('Equality on lists/dicts is not supported (unsound without value semantics)')
             # Late-bind unknowns to the other side
             if l_ty == ty.TANY and isinstance(expr.e1, Var):
                 sigma[expr.e1.name] = r_ty
@@ -227,11 +229,13 @@ def type_infer_BinOp(sigma, func_sigma, expr: BinOp):
             container_ty = type_infer_expr(sigma, func_sigma, expr.e2)
             elem_ty = None
             if isinstance(container_ty, ty.TARR):
-                elem_ty = container_ty.ty
+                raise TypeError('Membership on lists is not supported (unsound without list semantics)')
             elif isinstance(container_ty, ty.TSET):
                 elem_ty = container_ty.elem_ty
             elif isinstance(container_ty, ty.TDICT):
                 elem_ty = container_ty.key_ty
+            elif container_ty == ty.TANY:
+                raise TypeError('Membership on unknown container type is not supported')
             else:
                 # If unknown container, allow and infer later
                 elem_ty = ty.TANY
