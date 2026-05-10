@@ -1510,10 +1510,22 @@ def verify(inputs: List[Tuple[str, tc.types.SUPPORTED]]=[], requires: List[str]=
         @wraps(func)
         def caller(*args, **kargs):
             return func(*args, **kargs)
+        inherited_requires = list(getattr(func, "_veripy_requires", []))
+        inherited_ensures = list(getattr(func, "_veripy_ensures", []))
+        inherited_decreases = getattr(func, "_veripy_decreases", None)
+        merged_requires = list(dict.fromkeys(inherited_requires + list(requires)))
+        merged_ensures = list(dict.fromkeys(inherited_ensures + list(ensures)))
+        merged_decreases = decreases if decreases is not None else inherited_decreases
+        func._veripy_requires = merged_requires
+        func._veripy_ensures = merged_ensures
+        func._veripy_decreases = merged_decreases
+        caller._veripy_requires = merged_requires
+        caller._veripy_ensures = merged_ensures
+        caller._veripy_decreases = merged_decreases
         types = parse_func_types(func, inputs=inputs)
         scope = STORE.current_scope()
-        STORE.insert_func_attr(scope, func.__name__, types[0], types[1], types[2], requires, ensures, decreases)
-        STORE.push_verification(func.__name__, lambda: verify_func(func, scope, inputs, requires, ensures, modifies, reads))
+        STORE.insert_func_attr(scope, func.__name__, types[0], types[1], types[2], merged_requires, merged_ensures, merged_decreases)
+        STORE.push_verification(func.__name__, lambda: verify_func(func, scope, inputs, merged_requires, merged_ensures, modifies, reads))
         return caller
     return verify_impl
 

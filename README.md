@@ -58,6 +58,47 @@ def double(x: int) -> int:
 vp.verify_all()
 ```
 
+### Deppy-Style Contracts
+```python
+import veripy as vp
+
+vp.enable_verification()
+vp.scope("demo")
+
+@vp.verify()
+@vp.requires("x > 0")
+@vp.guarantee("result > x")
+def succ(x: int) -> int:
+    return x + 1
+
+vp.verify_all()
+```
+
+Veripy normalizes Deppy-style `result` postconditions to its internal `ans`
+binding and also exposes lightweight sidecar metadata helpers such as
+`@vp.about(...)`, `@vp.proof_for(...)`, and `@vp.z3_hint(...)`.
+
+### Lean4 Export
+```python
+import veripy as vp
+
+@vp.verify(requires=["x > 0"], ensures=["ans > x"])
+def succ(x: int) -> int:
+    return x + 1
+
+cert = vp.compile_to_lean(succ)
+print(cert.render())
+
+# Optional, if Lean is installed locally:
+# cert.verify_with_lean()
+```
+
+The Lean backend now exports Veripy's actual heap-lowered VC obligations rather
+than re-translating raw Python syntax. In practice that means the generated Lean
+theorems track the same `pre => wp` and side-condition formulas the SMT backend
+checks, including summary assumptions for verified callees and explicit heap
+state binders when lists/dicts/fields are involved.
+
 ### CLI Usage
 ```bash
 # Verify files

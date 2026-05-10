@@ -15,6 +15,9 @@ from . import auto_active
 from . import error
 from . import recursive
 from . import cli
+from . import contracts
+from . import sidecar
+from . import lean
 
 # Re-export key APIs for convenience
 from .core import (
@@ -33,6 +36,26 @@ from .core import (
     Expr2Z3,
     subst,
     pretty_print
+)
+
+from .contracts import (
+    requires,
+    guarantee,
+    ensures,
+    contract_decreases,
+    extract_spec
+)
+
+from .sidecar import (
+    about,
+    proof_for,
+    z3_hint,
+    law
+)
+
+from .lean import (
+    LeanCertificate,
+    compile_to_lean
 )
 
 from .auto_active import (
@@ -89,6 +112,9 @@ __all__ = [
     'error',
     'recursive',
     'cli',
+    'contracts',
+    'sidecar',
+    'lean',
     
     # Core verification
     'verify',
@@ -106,6 +132,17 @@ __all__ = [
     'Expr2Z3',
     'subst',
     'pretty_print',
+    'requires',
+    'guarantee',
+    'ensures',
+    'contract_decreases',
+    'extract_spec',
+    'about',
+    'proof_for',
+    'z3_hint',
+    'law',
+    'LeanCertificate',
+    'compile_to_lean',
     
     # Auto-active verification
     'AutoActiveEngine',
