@@ -13,11 +13,12 @@ Commands:
 
 import click
 
+from veripy import __version__
 from veripy.cli.commands import verify, check, version, info
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="veripy")
+@click.version_option(version=__version__, prog_name="veripy")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress all output except errors")
 @click.pass_context

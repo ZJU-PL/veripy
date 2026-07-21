@@ -35,7 +35,7 @@ Recent work is moving toward a Dafny/Boogie-style explicit heap model for **alia
 ## Installation
 
 ```bash
-pip install veripy
+pip install py-veripy
 ```
 
 For development:

@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-veripy"
+dynamic = ["version"]
+description = "A production-ready auto-active verification system for Python, similar to Dafny and Verus"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "rainoftime", email = "rainoftime@gmail.com"}
+]
+maintainers = [
+    {name = "rainoftime", email = "rainoftime@gmail.com"}
+]
+keywords = ["verification", "smt", "z3", "formal-methods", "python"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "z3-solver",
+    "rich",
+    "click",
+    "pyparsing",
+    "apronpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "pytest-timeout",
+    "flake8",
+    "black",
+    "isort",
+    "mypy",
+    "build",
+    "twine",
+]
+docs = [
+    "sphinx",
+    "sphinx-autodoc",
+]
+lsp = [
+    "python-lsp-server",
+]
+
+[project.scripts]
+veripy = "veripy.cli.main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "veripy.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["veripy", "veripy.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+timeout = 15
+timeout_method = "thread"
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "timeout: marks tests with a specific timeout value",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+
+[tool.flake8]
+max-line-length = 100
+exclude = [".venv", "venv", "build", "dist"]

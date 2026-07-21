@@ -72,10 +72,19 @@ shell:
 benchmark:
 	python -m pytest tests/ --benchmark-only --benchmark-json=benchmark.json
 
-# Release
-release: clean test
+# Distribution
+dist: clean  ## Build source distribution and wheel
 	python -m build
+
+# Release
+release: dist test ## Build and upload to PyPI
 	twine upload dist/*
+
+publish: dist  ## Build and upload to PyPI (alias for release)
+	twine upload dist/*
+
+publish-test: dist  ## Build and upload to TestPyPI
+	twine upload --repository testpypi dist/*
 
 # Help
 help:

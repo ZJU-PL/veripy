@@ -5,6 +5,8 @@ This package provides comprehensive verification capabilities for Python program
 inspired by Dafny and Verus.
 """
 
+__version__ = "0.1.1"
+
 # Import submodules to ensure they're registered
 from . import parser
 from . import typecheck
@@ -99,7 +101,7 @@ from .recursive import (
     verify_all_recursive
 )
 
-from .cli import __version__
+from .cli import __version__ as _cli_version  # noqa: F401  # registered via main __version__
 
 __all__ = [
     # Submodules
